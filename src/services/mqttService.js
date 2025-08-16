@@ -101,7 +101,21 @@ class MqttService {
       if (parts.length >= 2) {
         const phoneNumber = parts[0];
         const smsMessage = parts[1];
-        const timestamp = parts[2] ? new Date(parts[2]) : new Date();
+        let timestamp = new Date();
+        
+        // Handle timestamp from Arduino (milliseconds since boot)
+        if (parts[2]) {
+          const arduinoTimestamp = parseInt(parts[2]);
+          if (!isNaN(arduinoTimestamp)) {
+            // If it's a small number, it's milliseconds since Arduino boot, use current time
+            if (arduinoTimestamp < 1000000000000) {
+              timestamp = new Date();
+            } else {
+              // If it's a large number, treat as Unix timestamp
+              timestamp = new Date(arduinoTimestamp);
+            }
+          }
+        }
 
         try {
           await prisma.incomingSms.create({
@@ -111,26 +125,28 @@ class MqttService {
               receivedAt: timestamp
             }
           });
-          logger.info(`Stored incoming SMS from ${phoneNumber}`);
+          logger.info(`Stored incoming SMS from ${phoneNumber}: "${smsMessage}"`);
         } catch (error) {
           logger.error('Failed to store incoming SMS:', error);
         }
       }
     } else if (topic === 'sms/status') {
       // Handle SMS delivery status
-      // Expected format: smsId|status|error (optional)
+      // Expected format: phoneNumber|status|error (optional)
       const parts = message.split('|');
       if (parts.length >= 2) {
         const phoneNumber = parts[0];
         const status = parts[1];
         const errorMsg = parts[2] || null;
 
+        logger.info(`Received SMS status update for ${phoneNumber}: ${status}${errorMsg ? ` (${errorMsg})` : ''}`);
+
         try {
-          // Find the most recent SMS to this phone number that's pending
+          // Find the most recent SMS to this phone number that's pending or sent
           const smsLog = await prisma.smsLog.findFirst({
             where: {
               phoneNumber,
-              status: { in: ['PENDING', 'RETRY'] }
+              status: { in: ['PENDING', 'RETRY', 'SENT'] }
             },
             orderBy: { createdAt: 'desc' }
           });
@@ -143,8 +159,9 @@ class MqttService {
 
             if (status.toLowerCase() === 'sent') {
               updateData.sentAt = new Date();
+              updateData.errorMsg = null; // Clear any previous error
             } else if (status.toLowerCase() === 'failed') {
-              updateData.errorMsg = errorMsg;
+              updateData.errorMsg = errorMsg || 'SMS delivery failed';
             }
 
             await prisma.smsLog.update({
@@ -152,7 +169,9 @@ class MqttService {
               data: updateData
             });
 
-            logger.info(`Updated SMS status for ${phoneNumber}: ${status}`);
+            logger.info(`Updated SMS status for ${phoneNumber}: ${status} (SMS ID: ${smsLog.id})`);
+          } else {
+            logger.warn(`No pending SMS found for phone number: ${phoneNumber}`);
           }
         } catch (error) {
           logger.error('Failed to update SMS status:', error);
