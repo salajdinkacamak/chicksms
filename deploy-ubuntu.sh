@@ -12,7 +12,7 @@ echo "Node.js v23.x Compatible Version"
 echo ""
 
 # Configuration
-PROJECT_DIR="/var/www/chicksms"
+PROJECT_DIR="/var/www/html/chicksms"
 SERVICE_USER="www-data"
 REQUIRED_NODE_VERSION="20"
 
@@ -133,9 +133,9 @@ fi
 # Step 7: Setup project directory
 print_status "Setting up project directory: $PROJECT_DIR"
 mkdir -p $PROJECT_DIR
-mkdir -p $(dirname $PROJECT_DIR)/.npm
+mkdir -p /var/www/html/.npm
 chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
-chown -R $SERVICE_USER:$SERVICE_USER $(dirname $PROJECT_DIR)/.npm
+chown -R $SERVICE_USER:$SERVICE_USER /var/www/html/.npm
 
 # Step 8: Deploy application files
 if [ -f "package.json" ] && grep -q "chicksms" package.json; then
@@ -175,7 +175,7 @@ sudo -u $SERVICE_USER bash -c "
 print_status "Installing Node.js dependencies..."
 sudo -u $SERVICE_USER bash -c "
     cd $PROJECT_DIR
-    export NPM_CONFIG_CACHE=$PROJECT_DIR/.npm
+    export NPM_CONFIG_CACHE=/var/www/html/.npm
     npm install --production --no-audit --no-fund --legacy-peer-deps
 "
 
@@ -186,7 +186,7 @@ if [ $? -ne 0 ]; then
     print_status "Attempting installation with npm ci..."
     sudo -u $SERVICE_USER bash -c "
         cd $PROJECT_DIR
-        export NPM_CONFIG_CACHE=$PROJECT_DIR/.npm
+        export NPM_CONFIG_CACHE=/var/www/html/.npm
         npm ci --production --no-audit --no-fund
     " || {
         print_error "npm ci also failed. Installing dependencies individually..."
@@ -194,7 +194,7 @@ if [ $? -ne 0 ]; then
         # Install critical dependencies manually
         sudo -u $SERVICE_USER bash -c "
             cd $PROJECT_DIR
-            export NPM_CONFIG_CACHE=$PROJECT_DIR/.npm
+            export NPM_CONFIG_CACHE=/var/www/html/.npm
             npm install --production --no-audit --no-fund @prisma/client express mysql2 bcryptjs jsonwebtoken winston mqtt uuid cors helmet express-rate-limit dotenv
         "
     }
@@ -318,7 +318,7 @@ sudo -u $SERVICE_USER bash -c "
 
 # Setup PM2 startup script
 print_status "Setting up PM2 to start on boot..."
-env PATH=$PATH:/usr/bin pm2 startup systemd -u $SERVICE_USER --hp $PROJECT_DIR
+env PATH=$PATH:/usr/bin pm2 startup systemd -u $SERVICE_USER --hp /var/www/html
 
 # Step 16: Configure log rotation
 print_status "Setting up log rotation..."
