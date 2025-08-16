@@ -321,17 +321,21 @@ else
     log_warning "No seed file found. Skipping seeding."
 fi
 
-# Step 16: Application Build
-log_info "Step 16: Building application..."
+# Step 17: Application Build
+log_info "Step 17: Checking for build requirements..."
 if [ -f "package.json" ] && grep -q "\"build\":" package.json; then
+    log_info "Build script found, running build..."
     sudo -u $SERVICE_USER bash -c "
         cd $PROJECT_DIR
+        export NPM_CONFIG_CACHE=/var/www/.npm
         npm run build
     " || log_warning "Build script failed or not needed"
+else
+    log_info "No build script found in package.json - skipping build step"
 fi
 
-# Step 17: Fix permissions
-log_info "Step 17: Setting proper file permissions..."
+# Step 18: Fix permissions
+log_info "Step 18: Setting proper file permissions..."
 chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
 find $PROJECT_DIR -type f -exec chmod 644 {} \;
 find $PROJECT_DIR -type d -exec chmod 755 {} \;
@@ -341,8 +345,8 @@ chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
 mkdir -p $PROJECT_DIR/logs
 chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/logs
 
-# Step 18: PM2 Configuration
-log_info "Step 18: Configuring PM2..."
+# Step 19: PM2 Configuration
+log_info "Step 19: Configuring PM2..."
 
 # Create PM2 ecosystem config if not exists
 if [ ! -f "$PROJECT_DIR/ecosystem.config.js" ]; then
@@ -384,8 +388,8 @@ sudo -u $SERVICE_USER bash -c "
 log_info "Setting up PM2 to start on boot..."
 env PATH=$PATH:/usr/bin pm2 startup systemd -u $SERVICE_USER --hp /var/www
 
-# Step 19: Nginx Configuration
-log_info "Step 19: Configuring Nginx..."
+# Step 20: Nginx Configuration
+log_info "Step 20: Configuring Nginx..."
 tee /etc/nginx/sites-available/chicksms > /dev/null << 'EOF'
 server {
     listen 80;
@@ -408,8 +412,8 @@ EOF
 ln -sf /etc/nginx/sites-available/chicksms /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
 
-# Step 20: Configure log rotation
-log_info "Step 20: Setting up log rotation..."
+# Step 21: Configure log rotation
+log_info "Step 21: Setting up log rotation..."
 cat > /etc/logrotate.d/chicksms << EOF
 $PROJECT_DIR/logs/*.log {
     daily
@@ -423,8 +427,8 @@ $PROJECT_DIR/logs/*.log {
 }
 EOF
 
-# Step 21: Firewall Configuration
-log_info "Step 21: Configuring firewall..."
+# Step 22: Firewall Configuration
+log_info "Step 22: Configuring firewall..."
 ufw allow 22/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
@@ -432,8 +436,8 @@ ufw allow 3000/tcp
 ufw allow 1883/tcp  # MQTT
 echo "y" | ufw enable 2>/dev/null || ufw --force enable
 
-# Step 22: Final Service Checks
-log_info "Step 22: Checking services..."
+# Step 23: Final Service Checks
+log_info "Step 23: Checking services..."
 echo ""
 echo "Service Status:"
 echo "- MySQL: $(systemctl is-active mysql)"
@@ -441,8 +445,8 @@ echo "- Nginx: $(systemctl is-active nginx)"
 echo "- Mosquitto: $(systemctl is-active mosquitto)"
 echo "- PM2: $(sudo -u $SERVICE_USER pm2 list | grep chicksms | awk '{print $10}' || echo 'not running')"
 
-# Step 23: Application Health Check
-log_info "Step 23: Testing application..."
+# Step 24: Application Health Check
+log_info "Step 24: Testing application..."
 sleep 5
 
 if curl -f http://localhost:3000/health > /dev/null 2>&1; then
