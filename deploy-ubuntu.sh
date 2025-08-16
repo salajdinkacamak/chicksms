@@ -139,20 +139,35 @@ chown -R $SERVICE_USER:$SERVICE_USER /var/www/html/.npm
 
 # Step 8: Deploy application files
 if [ -f "package.json" ] && grep -q "chicksms" package.json; then
-    print_status "Copying application files..."
-    
-    # Copy files with proper ownership
-    cp -r . $PROJECT_DIR/
-    
-    # Fix ownership of all files
-    chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
-    
-    # Set proper permissions
-    find $PROJECT_DIR -type f -exec chmod 644 {} \;
-    find $PROJECT_DIR -type d -exec chmod 755 {} \;
-    chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
-    
-    print_status "Application files deployed successfully"
+    # Check if we're already in the target directory
+    if [ "$PWD" = "$PROJECT_DIR" ]; then
+        print_status "Running from target directory, fixing permissions..."
+        
+        # Just fix ownership and permissions
+        chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
+        
+        # Set proper permissions
+        find $PROJECT_DIR -type f -exec chmod 644 {} \;
+        find $PROJECT_DIR -type d -exec chmod 755 {} \;
+        chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
+        
+        print_status "Application files permissions updated"
+    else
+        print_status "Copying application files..."
+        
+        # Copy files with proper ownership using rsync to avoid conflicts
+        rsync -av --exclude='.git' --exclude='node_modules' --exclude='logs' . $PROJECT_DIR/
+        
+        # Fix ownership of all files
+        chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
+        
+        # Set proper permissions
+        find $PROJECT_DIR -type f -exec chmod 644 {} \;
+        find $PROJECT_DIR -type d -exec chmod 755 {} \;
+        chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
+        
+        print_status "Application files deployed successfully"
+    fi
 else
     print_error "Not running from ChickSMS project directory!"
     print_info "Please ensure you're running this script from the ChickSMS project root"
