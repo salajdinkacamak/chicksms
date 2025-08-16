@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  # ChickSMS Application
+  chicksms:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - DATABASE_URL=mysql://chicksms:chicksms_password@mysql:3306/chicksms
+      - JWT_SECRET=5b07b68ddae41758085c6ead07419b40eaa40a138e94c0985fc58091bf82383198f4fc060429cb85ffcf3db02656cdb9324718ded4c041fde7fd8c9f43aac610
+      - JWT_EXPIRE=7d
+      - MQTT_BROKER_URL=mqtt://mosquitto:1883
+      - MQTT_TOPIC=test/topic
+      - MQTT_CLIENT_ID=chicksms-server
+      - LOG_LEVEL=info
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - chicksms-network
+
+  # MySQL Database
+  mysql:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_DATABASE=chicksms
+      - MYSQL_USER=chicksms
+      - MYSQL_PASSWORD=chicksms_password
+    ports:
+      - "3307:3306"  # Use different port to avoid conflict with local MySQL
+    volumes:
+      - mysql_data:/var/lib/mysql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+    networks:
+      - chicksms-network
+
+  # MQTT Broker
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1884:1883"  # Use different port to avoid conflict
+      - "9002:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+    networks:
+      - chicksms-network
+
+  # Redis (optional, for future caching needs)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"  # Use different port to avoid conflict
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - chicksms-network
+
+  # phpMyAdmin (for database management)
+  phpmyadmin:
+    image: phpmyadmin:latest
+    environment:
+      - PMA_HOST=mysql
+      - PMA_USER=chicksms
+      - PMA_PASSWORD=chicksms_password
+      - PMA_PORT=3306
+    ports:
+      - "8081:80"  # Use different port to avoid conflict
+    depends_on:
+      - mysql
+    restart: unless-stopped
+    networks:
+      - chicksms-network
+
+volumes:
+  mysql_data:
+  mosquitto_data:
+  mosquitto_log:
+  redis_data:
+
+networks:
+  chicksms-network:
+    driver: bridge

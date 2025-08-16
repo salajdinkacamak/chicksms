@@ -1,0 +1,206 @@
+const mqtt = require('mqtt');
+const logger = require('../utils/logger');
+const { PrismaClient } = require('@prisma/client');
+
+const prisma = new PrismaClient();
+
+class MqttService {
+  constructor() {
+    this.client = null;
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
+  }
+
+  connect() {
+    try {
+      const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883';
+      const clientId = process.env.MQTT_CLIENT_ID || 'chicksms-server';
+
+      logger.info(`Connecting to MQTT broker: ${brokerUrl}`);
+
+      this.client = mqtt.connect(brokerUrl, {
+        clientId: `${clientId}-${Date.now()}`,
+        clean: true,
+        connectTimeout: 4000,
+        reconnectPeriod: 1000,
+        keepalive: 60
+      });
+
+      this.client.on('connect', () => {
+        logger.info('Connected to MQTT broker');
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
+
+        // Subscribe to incoming SMS topic if needed
+        const incomingTopic = 'sms/incoming';
+        this.client.subscribe(incomingTopic, (err) => {
+          if (err) {
+            logger.error('Failed to subscribe to incoming SMS topic:', err);
+          } else {
+            logger.info(`Subscribed to ${incomingTopic}`);
+          }
+        });
+
+        // Subscribe to delivery status topic
+        const statusTopic = 'sms/status';
+        this.client.subscribe(statusTopic, (err) => {
+          if (err) {
+            logger.error('Failed to subscribe to status topic:', err);
+          } else {
+            logger.info(`Subscribed to ${statusTopic}`);
+          }
+        });
+      });
+
+      this.client.on('disconnect', () => {
+        logger.warn('Disconnected from MQTT broker');
+        this.isConnected = false;
+      });
+
+      this.client.on('error', (error) => {
+        logger.error('MQTT connection error:', error);
+        this.isConnected = false;
+      });
+
+      this.client.on('offline', () => {
+        logger.warn('MQTT client is offline');
+        this.isConnected = false;
+      });
+
+      this.client.on('reconnect', () => {
+        this.reconnectAttempts++;
+        logger.info(`Attempting to reconnect to MQTT broker (attempt ${this.reconnectAttempts})`);
+        
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          logger.error('Max reconnection attempts reached');
+          this.client.end();
+        }
+      });
+
+      this.client.on('message', async (topic, message) => {
+        try {
+          await this.handleIncomingMessage(topic, message.toString());
+        } catch (error) {
+          logger.error('Error handling incoming MQTT message:', error);
+        }
+      });
+
+    } catch (error) {
+      logger.error('Failed to initialize MQTT connection:', error);
+    }
+  }
+
+  async handleIncomingMessage(topic, message) {
+    logger.info(`Received message on topic ${topic}: ${message}`);
+
+    if (topic === 'sms/incoming') {
+      // Handle incoming SMS
+      // Expected format: phoneNumber|message|timestamp
+      const parts = message.split('|');
+      if (parts.length >= 2) {
+        const phoneNumber = parts[0];
+        const smsMessage = parts[1];
+        const timestamp = parts[2] ? new Date(parts[2]) : new Date();
+
+        try {
+          await prisma.incomingSms.create({
+            data: {
+              phoneNumber,
+              message: smsMessage,
+              receivedAt: timestamp
+            }
+          });
+          logger.info(`Stored incoming SMS from ${phoneNumber}`);
+        } catch (error) {
+          logger.error('Failed to store incoming SMS:', error);
+        }
+      }
+    } else if (topic === 'sms/status') {
+      // Handle SMS delivery status
+      // Expected format: smsId|status|error (optional)
+      const parts = message.split('|');
+      if (parts.length >= 2) {
+        const phoneNumber = parts[0];
+        const status = parts[1];
+        const errorMsg = parts[2] || null;
+
+        try {
+          // Find the most recent SMS to this phone number that's pending
+          const smsLog = await prisma.smsLog.findFirst({
+            where: {
+              phoneNumber,
+              status: { in: ['PENDING', 'RETRY'] }
+            },
+            orderBy: { createdAt: 'desc' }
+          });
+
+          if (smsLog) {
+            const updateData = {
+              status: status.toUpperCase(),
+              updatedAt: new Date()
+            };
+
+            if (status.toLowerCase() === 'sent') {
+              updateData.sentAt = new Date();
+            } else if (status.toLowerCase() === 'failed') {
+              updateData.errorMsg = errorMsg;
+            }
+
+            await prisma.smsLog.update({
+              where: { id: smsLog.id },
+              data: updateData
+            });
+
+            logger.info(`Updated SMS status for ${phoneNumber}: ${status}`);
+          }
+        } catch (error) {
+          logger.error('Failed to update SMS status:', error);
+        }
+      }
+    }
+  }
+
+  async publishMessage(message) {
+    if (!this.isConnected || !this.client) {
+      logger.error('MQTT client is not connected');
+      return false;
+    }
+
+    try {
+      const topic = process.env.MQTT_TOPIC || 'test/topic';
+      
+      return new Promise((resolve) => {
+        this.client.publish(topic, message, { qos: 1 }, (error) => {
+          if (error) {
+            logger.error('Failed to publish MQTT message:', error);
+            resolve(false);
+          } else {
+            logger.info(`Published message to ${topic}: ${message}`);
+            resolve(true);
+          }
+        });
+      });
+    } catch (error) {
+      logger.error('Error publishing MQTT message:', error);
+      return false;
+    }
+  }
+
+  disconnect() {
+    if (this.client) {
+      this.client.end();
+      this.isConnected = false;
+      logger.info('Disconnected from MQTT broker');
+    }
+  }
+
+  getConnectionStatus() {
+    return {
+      connected: this.isConnected,
+      reconnectAttempts: this.reconnectAttempts
+    };
+  }
+}
+
+module.exports = new MqttService();

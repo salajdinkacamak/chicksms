@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # ChickSMS Application (Production)
+  chicksms:
+    build: 
+      context: .
+      dockerfile: Dockerfile.prod
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE=7d
+      - MQTT_BROKER_URL=${MQTT_BROKER_URL}
+      - MQTT_TOPIC=test/topic
+      - MQTT_CLIENT_ID=chicksms-server-prod
+      - LOG_LEVEL=warn
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - chicksms-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.chicksms.rule=Host(`sms.yourdomain.com`)"
+      - "traefik.http.routers.chicksms.tls=true"
+      - "traefik.http.routers.chicksms.tls.certresolver=letsencrypt"
+
+  # MQTT Broker (only if not using external)
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+    networks:
+      - chicksms-network
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:
+
+networks:
+  chicksms-network:
+    driver: bridge
