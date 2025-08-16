@@ -120,6 +120,10 @@ rm -rf node_modules/ 2>/dev/null || true
 rm -f package-lock.json 2>/dev/null || true
 npm cache clean --force 2>/dev/null || true
 
+# Create npm cache directory for service user
+mkdir -p /var/www/.npm
+chown -R $SERVICE_USER:$SERVICE_USER /var/www/.npm
+
 # Step 11: Install Dependencies with Prisma Compatibility
 log_info "Step 11: Installing Node.js dependencies..."
 
@@ -128,15 +132,15 @@ if [ "$PRISMA_MODE" = "compatible" ]; then
     log_warning "Using Prisma compatibility mode for Node.js v23.x"
     
     # Install core dependencies first
-    npm install --production --no-audit --no-fund express mysql2 bcryptjs jsonwebtoken winston mqtt uuid cors helmet express-rate-limit dotenv
+    NPM_CONFIG_CACHE=/var/www/.npm npm install --production --no-audit --no-fund express mysql2 bcryptjs jsonwebtoken winston mqtt uuid cors helmet express-rate-limit dotenv
     
     # Install specific Prisma versions
-    npm install @prisma/client@5.20.0 prisma@5.20.0 --save
+    NPM_CONFIG_CACHE=/var/www/.npm npm install @prisma/client@5.20.0 prisma@5.20.0 --save
     
     # Install engines for compatibility
-    npm install @prisma/engines@5.20.0 --save-dev
+    NPM_CONFIG_CACHE=/var/www/.npm npm install @prisma/engines@5.20.0 --save-dev
 else
-    npm install --production
+    NPM_CONFIG_CACHE=/var/www/.npm npm install --production
 fi
 
 # Step 12: Environment Configuration
@@ -194,8 +198,21 @@ else
     mysql -e "FLUSH PRIVILEGES;"
 fi
 
-# Step 14: Prisma Setup with Compatibility Handling
-log_info "Step 14: Setting up Prisma..."
+# Step 14: Fix permissions before Prisma setup
+log_info "Step 14: Setting proper file permissions..."
+chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
+find $PROJECT_DIR -type f -exec chmod 644 {} \;
+find $PROJECT_DIR -type d -exec chmod 755 {} \;
+chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
+
+# Create logs and cache directories
+mkdir -p $PROJECT_DIR/logs
+mkdir -p /var/www/.npm
+chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/logs
+chown -R $SERVICE_USER:$SERVICE_USER /var/www/.npm
+
+# Step 15: Prisma Setup with Compatibility Handling
+log_info "Step 15: Setting up Prisma..."
 
 # Set Prisma environment variables for compatibility
 export PRISMA_QUERY_ENGINE_BINARY_AUTO_DOWNLOAD=1
@@ -211,6 +228,7 @@ rm -rf prisma/generated
 log_info "Generating Prisma client..."
 sudo -u $SERVICE_USER bash -c "
     cd $PROJECT_DIR
+    export NPM_CONFIG_CACHE=/var/www/.npm
     export PRISMA_QUERY_ENGINE_BINARY_AUTO_DOWNLOAD=1
     export PRISMA_SCHEMA_ENGINE_BINARY_AUTO_DOWNLOAD=1
     export PRISMA_CLI_QUERY_ENGINE_TYPE=binary
@@ -223,6 +241,7 @@ sudo -u $SERVICE_USER bash -c "
     # Alternative: Use specific engine versions
     sudo -u $SERVICE_USER bash -c "
         cd $PROJECT_DIR
+        export NPM_CONFIG_CACHE=/var/www/.npm
         npm install @prisma/engines@5.20.0 --save-dev
         npx prisma generate --schema=./prisma/schema.prisma
     " || {
@@ -231,24 +250,27 @@ sudo -u $SERVICE_USER bash -c "
     }
 }
 
-# Step 15: Database Migration and Seeding
-log_info "Step 15: Running database migrations..."
+# Step 16: Database Migration and Seeding
+log_info "Step 16: Running database migrations..."
 sudo -u $SERVICE_USER bash -c "
     cd $PROJECT_DIR
+    export NPM_CONFIG_CACHE=/var/www/.npm
     npx prisma db push --schema=./prisma/schema.prisma
 " || {
     log_warning "Migration failed, trying alternative..."
     sudo -u $SERVICE_USER bash -c "
         cd $PROJECT_DIR
+        export NPM_CONFIG_CACHE=/var/www/.npm
         npx prisma migrate deploy --schema=./prisma/schema.prisma
     " || log_warning "Migration issues - database may need manual setup"
 }
 
 # Seed database with error handling
-log_info "Step 15.1: Seeding database..."
+log_info "Step 16.1: Seeding database..."
 if [ -f "prisma/seed.js" ]; then
     sudo -u $SERVICE_USER bash -c "
         cd $PROJECT_DIR
+        export NPM_CONFIG_CACHE=/var/www/.npm
         node prisma/seed.js
     " || {
         log_warning "Seeding failed, trying alternative methods..."
