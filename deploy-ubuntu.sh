@@ -226,7 +226,7 @@ if [ ! -f "$PROJECT_DIR/.env" ]; then
         cat > $PROJECT_DIR/.env << EOF
 NODE_ENV=production
 PORT=3000
-DATABASE_URL="mysql://chicksms_user:CHANGE_THIS_PASSWORD@localhost:3306/chicksms"
+DATABASE_URL="mysql://app_system:Nokiae72-1!@localhost:3306/chicksms"
 JWT_SECRET=$(openssl rand -base64 32)
 JWT_EXPIRE=7d
 MQTT_BROKER_URL=mqtt://localhost:1883
@@ -251,8 +251,8 @@ print_warning "Database Configuration Required!"
 echo ""
 print_info "Before proceeding, ensure your MySQL database is configured:"
 print_info "1. Database 'chicksms' exists"
-print_info "2. User 'chicksms_user' has full access to the database"
-print_info "3. Update the DATABASE_URL in .env file"
+print_info "2. User 'app_system' has full access to the database"
+print_info "3. Your existing user credentials are: app_system / Nokiae72-1!"
 echo ""
 
 read -p "Have you configured the database? (y/n): " -n 1 -r
