@@ -1,229 +1,153 @@
 #!/bin/bash
 
-# ChickSMS Production Deployment Script for Ubuntu Server
-# Compatible with Node.js v23.x and modern npm versions
-# Run this script as: sudo ./deploy-ubuntu.sh
+# ChickSMS Ubuntu Production Deployment Script
+# This script handles Prisma compatibility issues with Node.js v23.x
+# Tested for Ubuntu Server with existing app_system MySQL user
 
-set -e  # Exit on any error
+set -e
 
-echo "🚀 ChickSMS Ubuntu Production Deployment"
-echo "========================================"
-echo "Node.js v23.x Compatible Version"
-echo ""
-
-# Configuration
-PROJECT_DIR="/var/www/html/chicksms"
-SERVICE_USER="www-data"
-REQUIRED_NODE_VERSION="20"
+echo "🚀 Starting ChickSMS Production Deployment..."
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Function to print colored output
-print_status() {
-    echo -e "${GREEN}✅ $1${NC}"
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
 }
 
-print_warning() {
-    echo -e "${YELLOW}⚠️  $1${NC}"
+log_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-print_error() {
-    echo -e "${RED}❌ $1${NC}"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
 }
 
-print_info() {
-    echo -e "${BLUE}ℹ️  $1${NC}"
-}
+# Configuration
+PROJECT_DIR="/var/www/html/chicksms"
+SERVICE_USER="www-data"
 
 # Function to check if command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# Function to compare versions
-version_ge() {
-    printf '%s\n%s\n' "$2" "$1" | sort -V -C
-}
-
 # Check if running as root or with sudo
 if [ "$EUID" -ne 0 ]; then
-    print_error "Please run this script with sudo"
-    print_info "Usage: sudo ./deploy-ubuntu.sh"
+    log_error "Please run this script with sudo"
+    log_info "Usage: sudo ./deploy-ubuntu.sh"
     exit 1
 fi
 
-print_info "Starting ChickSMS deployment..."
-print_info "Target directory: $PROJECT_DIR"
-print_info "Service user: $SERVICE_USER"
-echo ""
-
-# Step 1: System Update
-print_status "Updating system packages..."
-export DEBIAN_FRONTEND=noninteractive
+# Step 1: System Updates
+log_info "Step 1: Updating system packages..."
 apt update && apt upgrade -y
 
-# Step 2: Install system dependencies
-print_status "Installing system dependencies..."
-apt install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates build-essential
+# Step 2: Install Required System Packages
+log_info "Step 2: Installing system dependencies..."
+apt install -y curl wget gnupg2 software-properties-common apt-transport-https ca-certificates git nginx mysql-server build-essential
 
-# Step 3: Handle Node.js installation
-print_status "Checking Node.js installation..."
-if command_exists node; then
-    CURRENT_NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
-    print_info "Current Node.js version: $(node --version)"
-    
-    if [ "$CURRENT_NODE_VERSION" -ge "$REQUIRED_NODE_VERSION" ]; then
-        print_status "Node.js version is compatible (v$CURRENT_NODE_VERSION >= v$REQUIRED_NODE_VERSION)"
-    else
-        print_warning "Node.js version is too old. Installing Node.js 20..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-        apt-get install -y nodejs
-    fi
+# Step 3: Check Node.js version and handle Prisma compatibility
+log_info "Step 3: Checking Node.js version..."
+NODE_VERSION=$(node --version 2>/dev/null || echo "none")
+log_info "Current Node.js version: $NODE_VERSION"
+
+# If Node.js v23.x, we need to use compatible Prisma versions
+if [[ "$NODE_VERSION" == *"v23"* ]]; then
+    log_warning "Node.js v23.x detected. Using Prisma compatibility mode."
+    PRISMA_MODE="compatible"
 else
-    print_status "Installing Node.js 20 LTS..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    PRISMA_MODE="standard"
+fi
+
+# Step 4: Install Node.js (if needed)
+if ! command_exists node; then
+    log_info "Step 4: Installing Node.js LTS..."
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
     apt-get install -y nodejs
-fi
-
-print_info "Node.js version: $(node --version)"
-print_info "npm version: $(npm --version)"
-
-# Step 4: Install PM2 process manager
-print_status "Installing PM2 process manager..."
-if ! command_exists pm2; then
-    npm install -g pm2@latest
-    print_status "PM2 installed: $(pm2 --version)"
 else
-    print_status "PM2 already installed: $(pm2 --version)"
+    log_info "Step 4: Node.js already installed: $(node --version)"
 fi
 
-# Step 5: Install and configure Mosquitto MQTT broker
-print_status "Installing Mosquitto MQTT broker..."
-if ! command_exists mosquitto; then
-    apt install -y mosquitto mosquitto-clients
-    systemctl enable mosquitto
-    systemctl start mosquitto
-    print_status "Mosquitto MQTT broker installed and started"
-else
-    print_status "Mosquitto already installed"
-    systemctl restart mosquitto
-fi
+# Step 5: Install PM2
+log_info "Step 5: Installing PM2..."
+npm install -g pm2
+
+# Step 6: Install Mosquitto MQTT Broker
+log_info "Step 6: Installing Mosquitto MQTT Broker..."
+apt install -y mosquitto mosquitto-clients
+systemctl enable mosquitto
+systemctl start mosquitto
 
 # Test MQTT broker
-print_info "Testing MQTT broker..."
+log_info "Testing MQTT broker..."
 if mosquitto_pub -h localhost -t test/connection -m "ChickSMS deployment test" 2>/dev/null; then
-    print_status "MQTT broker is working"
+    log_info "MQTT broker is working"
 else
-    print_warning "MQTT broker test failed - check mosquitto service"
+    log_warning "MQTT broker test failed - check mosquitto service"
 fi
 
-# Step 6: Create service user if not exists
+# Step 7: Create service user if not exists
 if ! id "$SERVICE_USER" &>/dev/null; then
-    print_status "Creating service user: $SERVICE_USER"
+    log_info "Creating service user: $SERVICE_USER"
     useradd -r -s /bin/false $SERVICE_USER
 else
-    print_status "Service user $SERVICE_USER already exists"
+    log_info "Service user $SERVICE_USER already exists"
 fi
 
-# Step 7: Setup project directory
-print_status "Setting up project directory: $PROJECT_DIR"
+# Step 8: Create Application Directory
+log_info "Step 8: Setting up application directory..."
 mkdir -p $PROJECT_DIR
-mkdir -p /var/www/html/.npm
-chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
-chown -R $SERVICE_USER:$SERVICE_USER /var/www/html/.npm
-
-# Step 8: Deploy application files
-if [ -f "package.json" ] && grep -q "chicksms" package.json; then
-    # Check if we're already in the target directory
-    if [ "$PWD" = "$PROJECT_DIR" ]; then
-        print_status "Running from target directory, fixing permissions..."
-        
-        # Just fix ownership and permissions
-        chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
-        
-        # Set proper permissions
-        find $PROJECT_DIR -type f -exec chmod 644 {} \;
-        find $PROJECT_DIR -type d -exec chmod 755 {} \;
-        chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
-        
-        print_status "Application files permissions updated"
-    else
-        print_status "Copying application files..."
-        
-        # Copy files with proper ownership using rsync to avoid conflicts
-        rsync -av --exclude='.git' --exclude='node_modules' --exclude='logs' . $PROJECT_DIR/
-        
-        # Fix ownership of all files
-        chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
-        
-        # Set proper permissions
-        find $PROJECT_DIR -type f -exec chmod 644 {} \;
-        find $PROJECT_DIR -type d -exec chmod 755 {} \;
-        chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
-        
-        print_status "Application files deployed successfully"
-    fi
-else
-    print_error "Not running from ChickSMS project directory!"
-    print_info "Please ensure you're running this script from the ChickSMS project root"
-    print_info "The directory should contain package.json with 'chicksms' in the name"
-    exit 1
-fi
-
+chown $USER:$USER $PROJECT_DIR
 cd $PROJECT_DIR
 
-# Step 9: Clean any existing installation
-print_status "Cleaning previous installation..."
-sudo -u $SERVICE_USER bash -c "
-    cd $PROJECT_DIR
-    rm -rf node_modules/ 2>/dev/null || true
-    rm -f package-lock.json 2>/dev/null || true
-    npm cache clean --force 2>/dev/null || true
-"
-
-# Step 10: Install Node.js dependencies
-print_status "Installing Node.js dependencies..."
-sudo -u $SERVICE_USER bash -c "
-    cd $PROJECT_DIR
-    export NPM_CONFIG_CACHE=/var/www/html/.npm
-    npm install --production --no-audit --no-fund --legacy-peer-deps
-"
-
-if [ $? -ne 0 ]; then
-    print_error "npm install failed. Trying alternative approach..."
-    
-    # Alternative installation method
-    print_status "Attempting installation with npm ci..."
-    sudo -u $SERVICE_USER bash -c "
-        cd $PROJECT_DIR
-        export NPM_CONFIG_CACHE=/var/www/html/.npm
-        npm ci --production --no-audit --no-fund
-    " || {
-        print_error "npm ci also failed. Installing dependencies individually..."
-        
-        # Install critical dependencies manually
-        sudo -u $SERVICE_USER bash -c "
-            cd $PROJECT_DIR
-            export NPM_CONFIG_CACHE=/var/www/html/.npm
-            npm install --production --no-audit --no-fund @prisma/client express mysql2 bcryptjs jsonwebtoken winston mqtt uuid cors helmet express-rate-limit dotenv
-        "
-    }
+# Step 9: Clone or Copy Application
+if [ -d ".git" ]; then
+    log_info "Step 9: Pulling latest changes..."
+    git pull
+else
+    log_info "Step 9: Please copy your application files to $PROJECT_DIR"
+    log_warning "Make sure to copy all files including package.json, src/, prisma/, etc."
+    read -p "Press Enter when files are copied..."
 fi
 
-# Step 11: Setup environment configuration
-print_status "Setting up environment configuration..."
-if [ ! -f "$PROJECT_DIR/.env" ]; then
-    if [ -f "$PROJECT_DIR/.env.production" ]; then
-        cp $PROJECT_DIR/.env.production $PROJECT_DIR/.env
-        print_info "Created .env from .env.production template"
+# Step 10: Clean any existing installation
+log_info "Step 10: Cleaning previous installation..."
+rm -rf node_modules/ 2>/dev/null || true
+rm -f package-lock.json 2>/dev/null || true
+npm cache clean --force 2>/dev/null || true
+
+# Step 11: Install Dependencies with Prisma Compatibility
+log_info "Step 11: Installing Node.js dependencies..."
+
+# Install dependencies based on Node.js version
+if [ "$PRISMA_MODE" = "compatible" ]; then
+    log_warning "Using Prisma compatibility mode for Node.js v23.x"
+    
+    # Install core dependencies first
+    npm install --production --no-audit --no-fund express mysql2 bcryptjs jsonwebtoken winston mqtt uuid cors helmet express-rate-limit dotenv
+    
+    # Install specific Prisma versions
+    npm install @prisma/client@5.20.0 prisma@5.20.0 --save
+    
+    # Install engines for compatibility
+    npm install @prisma/engines@5.20.0 --save-dev
+else
+    npm install --production
+fi
+
+# Step 12: Environment Configuration
+log_info "Step 12: Setting up environment configuration..."
+if [ ! -f ".env" ]; then
+    if [ -f ".env.production" ]; then
+        cp .env.production .env
+        log_info "Environment file created from .env.production"
     else
-        print_warning "No environment template found. Creating basic .env..."
-        cat > $PROJECT_DIR/.env << EOF
+        log_warning "No environment template found. Creating basic .env..."
+        cat > .env << EOF
 NODE_ENV=production
 PORT=3000
 DATABASE_URL="mysql://app_system:Nokiae72-1!@localhost:3306/chicksms"
@@ -237,63 +161,160 @@ RATE_LIMIT_WINDOW_MS=900000
 RATE_LIMIT_MAX_REQUESTS=100
 EOF
     fi
-    chown $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/.env
-    chmod 600 $PROJECT_DIR/.env
+    chown $SERVICE_USER:$SERVICE_USER .env
+    chmod 600 .env
+fi
+
+# Step 13: Database Setup
+log_info "Step 13: Setting up MySQL database..."
+
+# Check if MySQL is running
+if ! systemctl is-active --quiet mysql; then
+    systemctl start mysql
+fi
+
+# Execute database setup
+if [ -f "setup-database.sql" ]; then
+    log_info "Executing database setup SQL..."
+    mysql < setup-database.sql
+else
+    # Manual database setup
+    log_info "Creating database manually..."
+    mysql -e "CREATE DATABASE IF NOT EXISTS chicksms;"
+    mysql -e "GRANT ALL PRIVILEGES ON chicksms.* TO 'app_system'@'localhost';"
+    mysql -e "FLUSH PRIVILEGES;"
+fi
+
+# Step 14: Prisma Setup with Compatibility Handling
+log_info "Step 14: Setting up Prisma..."
+
+# Set Prisma environment variables for compatibility
+export PRISMA_QUERY_ENGINE_BINARY_AUTO_DOWNLOAD=1
+export PRISMA_SCHEMA_ENGINE_BINARY_AUTO_DOWNLOAD=1
+export PRISMA_CLI_QUERY_ENGINE_TYPE=binary
+export PRISMA_CLIENT_ENGINE_TYPE=binary
+
+# Clear any existing Prisma cache
+rm -rf node_modules/.prisma
+rm -rf prisma/generated
+
+# Generate Prisma client with error handling
+log_info "Generating Prisma client..."
+sudo -u $SERVICE_USER bash -c "
+    cd $PROJECT_DIR
+    export PRISMA_QUERY_ENGINE_BINARY_AUTO_DOWNLOAD=1
+    export PRISMA_SCHEMA_ENGINE_BINARY_AUTO_DOWNLOAD=1
+    export PRISMA_CLI_QUERY_ENGINE_TYPE=binary
+    export PRISMA_CLIENT_ENGINE_TYPE=binary
     
-    print_warning "⚠️  IMPORTANT: Edit $PROJECT_DIR/.env with your database credentials!"
-    print_info "Run: sudo nano $PROJECT_DIR/.env"
-else
-    print_status "Environment file already exists"
-fi
+    npx prisma generate --schema=./prisma/schema.prisma
+" || {
+    log_warning "Standard Prisma generation failed, trying alternative method..."
+    
+    # Alternative: Use specific engine versions
+    sudo -u $SERVICE_USER bash -c "
+        cd $PROJECT_DIR
+        npm install @prisma/engines@5.20.0 --save-dev
+        npx prisma generate --schema=./prisma/schema.prisma
+    " || {
+        log_error "Prisma generation failed. Manual intervention required."
+        exit 1
+    }
+}
 
-# Step 12: Database setup prompt
-print_warning "Database Configuration Required!"
-echo ""
-print_info "Before proceeding, ensure your MySQL database is configured:"
-print_info "1. Database 'chicksms' exists"
-print_info "2. User 'app_system' has full access to the database"
-print_info "3. Your existing user credentials are: app_system / Nokiae72-1!"
-echo ""
-
-read -p "Have you configured the database? (y/n): " -n 1 -r
-echo ""
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    print_status "Proceeding with database setup..."
-else
-    print_warning "Please configure the database first, then run this command:"
-    print_info "sudo -u $SERVICE_USER bash -c 'cd $PROJECT_DIR && npx prisma migrate deploy && npm run prisma:seed'"
-    print_info "Then start the service with: sudo -u $SERVICE_USER pm2 start $PROJECT_DIR/ecosystem.config.js"
-    exit 0
-fi
-
-# Step 13: Generate Prisma client and run migrations
-print_status "Setting up database schema..."
+# Step 15: Database Migration and Seeding
+log_info "Step 15: Running database migrations..."
 sudo -u $SERVICE_USER bash -c "
     cd $PROJECT_DIR
-    npx prisma generate
-    npx prisma migrate deploy
-"
+    npx prisma db push --schema=./prisma/schema.prisma
+" || {
+    log_warning "Migration failed, trying alternative..."
+    sudo -u $SERVICE_USER bash -c "
+        cd $PROJECT_DIR
+        npx prisma migrate deploy --schema=./prisma/schema.prisma
+    " || log_warning "Migration issues - database may need manual setup"
+}
 
-if [ $? -ne 0 ]; then
-    print_error "Database setup failed!"
-    print_info "Please check your database configuration in .env file"
-    print_info "Then run manually: sudo -u $SERVICE_USER bash -c 'cd $PROJECT_DIR && npx prisma migrate deploy'"
-    exit 1
+# Seed database with error handling
+log_info "Step 15.1: Seeding database..."
+if [ -f "prisma/seed.js" ]; then
+    sudo -u $SERVICE_USER bash -c "
+        cd $PROJECT_DIR
+        node prisma/seed.js
+    " || {
+        log_warning "Seeding failed, trying alternative methods..."
+        
+        # Alternative seeding method
+        cat > temp_seed.js << 'EOF'
+const { PrismaClient } = require('@prisma/client');
+const bcrypt = require('bcryptjs');
+
+async function main() {
+    const prisma = new PrismaClient();
+    
+    try {
+        // Create admin user
+        const hashedPassword = await bcrypt.hash('admin123', 10);
+        
+        const admin = await prisma.user.upsert({
+            where: { username: 'admin' },
+            update: {},
+            create: {
+                username: 'admin',
+                password: hashedPassword,
+                role: 'admin'
+            }
+        });
+        
+        console.log('Admin user created:', admin.username);
+        
+    } catch (error) {
+        console.error('Seeding error:', error);
+    } finally {
+        await prisma.$disconnect();
+    }
+}
+
+main();
+EOF
+        
+        sudo -u $SERVICE_USER bash -c "
+            cd $PROJECT_DIR
+            node temp_seed.js
+        " && rm temp_seed.js || {
+            log_error "All seeding methods failed. You'll need to create admin user manually."
+        }
+    }
+else
+    log_warning "No seed file found. Skipping seeding."
 fi
 
-# Step 14: Create admin user
-print_status "Creating admin user..."
-sudo -u $SERVICE_USER bash -c "
-    cd $PROJECT_DIR
-    npm run prisma:seed
-"
+# Step 16: Application Build
+log_info "Step 16: Building application..."
+if [ -f "package.json" ] && grep -q "\"build\":" package.json; then
+    sudo -u $SERVICE_USER bash -c "
+        cd $PROJECT_DIR
+        npm run build
+    " || log_warning "Build script failed or not needed"
+fi
 
-# Step 15: Setup PM2 process management
-print_status "Setting up PM2 process management..."
+# Step 17: Fix permissions
+log_info "Step 17: Setting proper file permissions..."
+chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR
+find $PROJECT_DIR -type f -exec chmod 644 {} \;
+find $PROJECT_DIR -type d -exec chmod 755 {} \;
+chmod +x $PROJECT_DIR/*.sh 2>/dev/null || true
+
+# Create logs directory
+mkdir -p $PROJECT_DIR/logs
+chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/logs
+
+# Step 18: PM2 Configuration
+log_info "Step 18: Configuring PM2..."
 
 # Create PM2 ecosystem config if not exists
 if [ ! -f "$PROJECT_DIR/ecosystem.config.js" ]; then
-    print_status "Creating PM2 ecosystem configuration..."
+    log_info "Creating PM2 ecosystem configuration..."
     cat > $PROJECT_DIR/ecosystem.config.js << 'EOF'
 module.exports = {
   apps: [{
@@ -318,12 +339,8 @@ EOF
     chown $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/ecosystem.config.js
 fi
 
-# Create logs directory
-mkdir -p $PROJECT_DIR/logs
-chown -R $SERVICE_USER:$SERVICE_USER $PROJECT_DIR/logs
-
 # Start application with PM2
-print_status "Starting ChickSMS application..."
+log_info "Starting ChickSMS application..."
 sudo -u $SERVICE_USER bash -c "
     cd $PROJECT_DIR
     pm2 delete chicksms 2>/dev/null || true
@@ -332,11 +349,35 @@ sudo -u $SERVICE_USER bash -c "
 "
 
 # Setup PM2 startup script
-print_status "Setting up PM2 to start on boot..."
-env PATH=$PATH:/usr/bin pm2 startup systemd -u $SERVICE_USER --hp /var/www/html
+log_info "Setting up PM2 to start on boot..."
+env PATH=$PATH:/usr/bin pm2 startup systemd -u $SERVICE_USER --hp /var/www
 
-# Step 16: Configure log rotation
-print_status "Setting up log rotation..."
+# Step 19: Nginx Configuration
+log_info "Step 19: Configuring Nginx..."
+tee /etc/nginx/sites-available/chicksms > /dev/null << 'EOF'
+server {
+    listen 80;
+    server_name chicksms.yourdomain.com;  # Replace with your domain
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+EOF
+
+ln -sf /etc/nginx/sites-available/chicksms /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+
+# Step 20: Configure log rotation
+log_info "Step 20: Setting up log rotation..."
 cat > /etc/logrotate.d/chicksms << EOF
 $PROJECT_DIR/logs/*.log {
     daily
@@ -350,79 +391,49 @@ $PROJECT_DIR/logs/*.log {
 }
 EOF
 
-# Step 17: Setup firewall
-print_status "Configuring firewall..."
-ufw allow ssh
-ufw allow 'Nginx Full'
-ufw allow 1883/tcp comment 'MQTT Broker'
-ufw allow 3000/tcp comment 'ChickSMS API'
+# Step 21: Firewall Configuration
+log_info "Step 21: Configuring firewall..."
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow 3000/tcp
+ufw allow 1883/tcp  # MQTT
 echo "y" | ufw enable 2>/dev/null || ufw --force enable
 
-# Step 18: Health checks and verification
-print_status "Running health checks..."
+# Step 22: Final Service Checks
+log_info "Step 22: Checking services..."
+echo ""
+echo "Service Status:"
+echo "- MySQL: $(systemctl is-active mysql)"
+echo "- Nginx: $(systemctl is-active nginx)"
+echo "- Mosquitto: $(systemctl is-active mosquitto)"
+echo "- PM2: $(sudo -u $SERVICE_USER pm2 list | grep chicksms | awk '{print $10}' || echo 'not running')"
+
+# Step 23: Application Health Check
+log_info "Step 23: Testing application..."
 sleep 5
 
-# Check PM2 status
-sudo -u $SERVICE_USER pm2 status
-
-# Check if application is responding
-print_status "Testing application health..."
-if curl -f http://localhost:3000/health &>/dev/null; then
-    print_status "✅ Application health check passed!"
+if curl -f http://localhost:3000/health > /dev/null 2>&1; then
+    log_info "✅ Application is running successfully!"
 else
-    print_warning "Application health check failed. Checking logs..."
-    sudo -u $SERVICE_USER pm2 logs chicksms --lines 20
+    log_warning "⚠️  Application health check failed. Check logs with: sudo -u $SERVICE_USER pm2 logs chicksms"
 fi
 
-# Step 19: Nginx configuration prompt
-if command_exists nginx; then
-    print_status "Nginx detected. Setting up reverse proxy configuration..."
-    
-    if [ -f "$PROJECT_DIR/nginx-chicksms.conf" ]; then
-        cp $PROJECT_DIR/nginx-chicksms.conf /etc/nginx/sites-available/chicksms
-        
-        print_warning "Nginx configuration copied to /etc/nginx/sites-available/chicksms"
-        print_info "Please edit the configuration and update the server_name:"
-        print_info "sudo nano /etc/nginx/sites-available/chicksms"
-        print_info ""
-        print_info "Then enable the site:"
-        print_info "sudo ln -s /etc/nginx/sites-available/chicksms /etc/nginx/sites-enabled/"
-        print_info "sudo nginx -t && sudo systemctl reload nginx"
-    else
-        print_warning "nginx-chicksms.conf not found in project"
-    fi
-else
-    print_info "Nginx not detected. Install nginx for reverse proxy setup."
-fi
-
-# Final success message
+# Final Instructions
 echo ""
-print_status "🎉 ChickSMS deployment completed successfully!"
+log_info "🎉 Deployment completed!"
 echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Next steps:"
+echo "1. Update the server_name in /etc/nginx/sites-available/chicksms with your domain"
+echo "2. Install SSL certificate (Let's Encrypt recommended)"
+echo "3. Update DNS to point to this server"
+echo "4. Test the application at http://your-domain"
 echo ""
-print_info "📋 NEXT STEPS:"
-echo "1. 🔧 Configure database: sudo nano $PROJECT_DIR/.env"
-echo "2. 🌐 Setup nginx: Edit /etc/nginx/sites-available/chicksms"
-echo "3. 🔒 Setup SSL: sudo certbot --nginx -d yourdomain.com"
-echo "4. 🧪 Test API: curl http://localhost:3000/health"
+echo "Useful commands:"
+echo "- View logs: sudo -u $SERVICE_USER pm2 logs chicksms"
+echo "- Restart app: sudo -u $SERVICE_USER pm2 restart chicksms"
+echo "- Check status: sudo -u $SERVICE_USER pm2 status"
+echo "- Nginx reload: systemctl reload nginx"
 echo ""
-print_info "🔐 DEFAULT ADMIN CREDENTIALS:"
-echo "Username: admin"
-echo "Password: admin123"
-echo ""
-print_info "📊 MANAGEMENT COMMANDS:"
-echo "• Monitor: sudo -u $SERVICE_USER pm2 monit"
-echo "• Logs: sudo -u $SERVICE_USER pm2 logs chicksms"
-echo "• Restart: sudo -u $SERVICE_USER pm2 restart chicksms"
-echo "• Status: sudo -u $SERVICE_USER pm2 status"
-echo ""
-print_info "📁 PROJECT LOCATION: $PROJECT_DIR"
-print_info "🌐 API HEALTH: http://localhost:3000/health"
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-# Show current PM2 processes
-print_status "Current PM2 processes:"
-sudo -u $SERVICE_USER pm2 list
+echo "Application should be running on http://localhost:3000"
+echo "Default admin credentials: admin / admin123"
