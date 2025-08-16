@@ -72,9 +72,10 @@ else
     log_info "Step 4: Node.js already installed: $(node --version)"
 fi
 
-# Step 5: Install PM2
-log_info "Step 5: Installing PM2..."
+# Step 5: Install PM2 and Prisma CLI
+log_info "Step 5: Installing PM2 and Prisma CLI..."
 npm install -g pm2
+npm install -g prisma@5.20.0
 
 # Step 6: Install Mosquitto MQTT Broker
 log_info "Step 6: Installing Mosquitto MQTT Broker..."
