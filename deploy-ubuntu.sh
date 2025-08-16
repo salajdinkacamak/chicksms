@@ -176,11 +176,20 @@ fi
 # Execute database setup
 if [ -f "setup-database.sql" ]; then
     log_info "Executing database setup SQL..."
-    mysql < setup-database.sql
+    if mysql < setup-database.sql; then
+        log_info "Database setup completed successfully"
+    else
+        log_warning "Database setup SQL failed, trying manual approach..."
+        # Manual database setup as fallback
+        mysql -e "CREATE DATABASE IF NOT EXISTS chicksms CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" || log_warning "Database already exists"
+        mysql -e "GRANT ALL PRIVILEGES ON chicksms.* TO 'app_system'@'localhost';" || log_warning "Grant failed - user may already have permissions"
+        mysql -e "FLUSH PRIVILEGES;"
+        log_info "Manual database setup completed"
+    fi
 else
     # Manual database setup
     log_info "Creating database manually..."
-    mysql -e "CREATE DATABASE IF NOT EXISTS chicksms;"
+    mysql -e "CREATE DATABASE IF NOT EXISTS chicksms CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     mysql -e "GRANT ALL PRIVILEGES ON chicksms.* TO 'app_system'@'localhost';"
     mysql -e "FLUSH PRIVILEGES;"
 fi
