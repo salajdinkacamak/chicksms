@@ -6,6 +6,7 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 const prisma = new PrismaClient();
+const DELAY_BETWEEN_MESSAGES  = 3000; // 3 seconds
 
 // Send SMS endpoint
 router.post('/send', authMiddleware, async (req, res) => {
@@ -248,7 +249,7 @@ router.post('/bulk', authMiddleware, async (req, res) => {
         }
 
         // Add small delay between messages to avoid overwhelming
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_MESSAGES));
 
       } catch (error) {
         logger.error(`Bulk SMS error for ${phoneNumber}:`, error);
