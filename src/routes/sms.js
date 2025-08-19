@@ -6,7 +6,7 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 const prisma = new PrismaClient();
-const DELAY_BETWEEN_MESSAGES  = 3000; // 3 seconds
+const DELAY_BETWEEN_MESSAGES  = 10000; // 10 seconds
 
 // Send SMS endpoint
 router.post('/send', authMiddleware, async (req, res) => {
