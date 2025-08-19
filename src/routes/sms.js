@@ -6,7 +6,7 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 const prisma = new PrismaClient();
-const DELAY_BETWEEN_MESSAGES  = 10000; // 10 seconds - safe delay to avoid carrier blocking
+const DELAY_BETWEEN_MESSAGES  = 12000; // 12 seconds - safe delay to prevent Arduino overwhelm and carrier blocking
 
 // Send SMS endpoint
 router.post('/send', authMiddleware, async (req, res) => {
@@ -37,7 +37,7 @@ router.post('/send', authMiddleware, async (req, res) => {
       }
     });
 
-    // Send via MQTT to Arduino
+    // Send via MQTT to Arduino (individual SMS)
     const mqttMessage = `${phoneNumber}|${message}`;
     const success = await mqttService.publishMessage(mqttMessage);
 
@@ -338,14 +338,15 @@ router.post('/bulk', authMiddleware, async (req, res) => {
         failed: failedCount
       },
       results,
-      note: 'Messages are being processed in background. Check status endpoint for updates.'
+      note: 'Messages are being processed in background with 12-second intervals. Check status endpoint for updates.'
     });
 
     // Process messages in background without blocking the response
     setImmediate(async () => {
-      logger.info(`Starting background processing of ${queuedCount} SMS messages`);
+      logger.info(`Starting background processing of ${queuedCount} SMS messages with 12-second intervals`);
       
-      for (const recipient of validRecipients) {
+      for (let i = 0; i < validRecipients.length; i++) {
+        const recipient = validRecipients[i];
         try {
           // Update status to PENDING before sending
           await prisma.smsLog.update({
@@ -356,7 +357,9 @@ router.post('/bulk', authMiddleware, async (req, res) => {
             }
           });
 
-          // Send via MQTT
+          logger.info(`Processing SMS ${i + 1}/${queuedCount} to ${recipient.phoneNumber}`);
+
+          // Send via MQTT - Arduino expects individual SMS
           const mqttMessage = `${recipient.phoneNumber}|${message}`;
           const success = await mqttService.publishMessage(mqttMessage);
 
@@ -368,7 +371,7 @@ router.post('/bulk', authMiddleware, async (req, res) => {
                 sentAt: new Date()
               }
             });
-            logger.info(`SMS sent to ${recipient.phoneNumber} (ID: ${recipient.smsId})`);
+            logger.info(`✅ SMS sent to ${recipient.phoneNumber} (${i + 1}/${queuedCount})`);
           } else {
             await prisma.smsLog.update({
               where: { id: recipient.smsId },
@@ -377,13 +380,14 @@ router.post('/bulk', authMiddleware, async (req, res) => {
                 errorMsg: 'Failed to publish to MQTT broker'
               }
             });
-            logger.error(`Failed to send SMS to ${recipient.phoneNumber} (ID: ${recipient.smsId})`);
+            logger.error(`❌ Failed to send SMS to ${recipient.phoneNumber} (${i + 1}/${queuedCount})`);
           }
 
           processedCount++;
           
-          // Add delay between messages to prevent overwhelming the ESP32
-          if (processedCount < queuedCount) {
+          // Add 12-second delay between messages (except after the last one)
+          if (i < validRecipients.length - 1) {
+            logger.info(`⏳ Waiting 12 seconds before next SMS (${processedCount}/${queuedCount} completed)`);
             await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_MESSAGES));
           }
 
@@ -394,7 +398,7 @@ router.post('/bulk', authMiddleware, async (req, res) => {
               where: { id: recipient.smsId },
               data: { 
                 status: 'FAILED',
-                errorMsg: 'Background processing error'
+                errorMsg: 'Background processing error: ' + error.message
               }
             });
           } catch (dbError) {
@@ -403,7 +407,7 @@ router.post('/bulk', authMiddleware, async (req, res) => {
         }
       }
 
-      logger.info(`Bulk SMS background processing completed: ${processedCount}/${queuedCount} processed`);
+      logger.info(`🎉 Bulk SMS background processing completed: ${processedCount}/${queuedCount} processed successfully`);
     });
 
   } catch (error) {

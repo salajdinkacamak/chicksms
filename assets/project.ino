@@ -3,8 +3,8 @@
 #include <HardwareSerial.h>
 
 // --- WIFI SETTINGS ---
-const char* ssid = "Salajdin";
-const char* password = "33337777";
+const char* ssid = "ITP Coworking";
+const char* password = "1nnovation";
 
 // --- MQTT SETTINGS ---
 const char* mqtt_server = "95.217.15.58"; // your PC Mosquitto IP
@@ -22,20 +22,16 @@ const int SIM800_BAUD = 9600;
 unsigned long lastSMSCheck = 0;
 const unsigned long SMS_CHECK_INTERVAL = 10000; // Check for new SMS every 10 seconds
 
-// --- SMS QUEUE MANAGEMENT ---
-struct SMSMessage {
-  String phoneNumber;
-  String message;
-};
-
-const int MAX_QUEUE_SIZE = 10;
-SMSMessage smsQueue[MAX_QUEUE_SIZE];
-int queueHead = 0;
-int queueTail = 0;
-int queueSize = 0;
+// --- SIMPLE SMS MANAGEMENT ---
 bool isProcessingSMS = false;
 unsigned long lastSMSProcessTime = 0;
-const unsigned long SMS_PROCESS_INTERVAL = 3000; // Process one SMS every 3 seconds
+const unsigned long SMS_PROCESS_INTERVAL = 10000; // 10 seconds between SMS for safety
+
+// --- SAFETY MEASURES ---
+unsigned long lastWatchdogFeed = 0;
+const unsigned long WATCHDOG_INTERVAL = 1000; // Feed watchdog every second
+unsigned long freeHeapCheckTime = 0;
+const unsigned long HEAP_CHECK_INTERVAL = 30000; // Check heap every 30 seconds
 
 // --- MQTT CLIENT ---
 WiFiClient espClient;
@@ -509,79 +505,75 @@ void deleteSMS(String index) {
   Serial.println("Deleted SMS at index: " + index);
 }
 
-// SMS Queue Management Functions
-bool addToSMSQueue(String phone, String text) {
-  if (queueSize >= MAX_QUEUE_SIZE) {
-    Serial.println("⚠️  SMS Queue is full, dropping message");
-    reportSMSStatus(phone, "FAILED", "Queue full");
-    return false;
-  }
-  
-  smsQueue[queueTail].phoneNumber = phone;
-  smsQueue[queueTail].message = text;
-  queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
-  queueSize++;
-  
-  Serial.println("📥 Added SMS to queue. Queue size: " + String(queueSize));
-  return true;
-}
-
-bool getFromSMSQueue(String &phone, String &text) {
-  if (queueSize == 0) {
-    return false;
-  }
-  
-  phone = smsQueue[queueHead].phoneNumber;
-  text = smsQueue[queueHead].message;
-  queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
-  queueSize--;
-  
-  Serial.println("📤 Retrieved SMS from queue. Queue size: " + String(queueSize));
-  return true;
-}
-
-void processSMSQueue() {
-  // Check if we should process the next SMS
-  if (isProcessingSMS || queueSize == 0) {
-    return;
-  }
-  
-  // Check if enough time has passed since last SMS
-  if (millis() - lastSMSProcessTime < SMS_PROCESS_INTERVAL) {
-    return;
-  }
-  
-  String phone, text;
-  if (getFromSMSQueue(phone, text)) {
-    isProcessingSMS = true;
-    lastSMSProcessTime = millis();
-    
-    Serial.println("🚀 Processing queued SMS to: " + phone);
-    bool success = sendSMSImmediate(phone, text);
-    
-    if (success) {
-      Serial.println("✅ Queued SMS sent successfully");
-    } else {
-      Serial.println("❌ Queued SMS failed to send");
-    }
-    
-    isProcessingSMS = false;
-  }
-}
-
+// Simple SMS Management Functions - No Queue
 bool sendSMS(String phone, String text) {
-  // Add to queue instead of sending immediately during bulk operations
-  return addToSMSQueue(phone, text);
+  // Check if we can send SMS now
+  if (isProcessingSMS) {
+    Serial.println("⚠️  SMS already in progress, ignoring request for: " + phone);
+    reportSMSStatus(phone, "FAILED", "SMS in progress - try later");
+    return false;
+  }
+  
+  // Check timing interval
+  if (millis() - lastSMSProcessTime < SMS_PROCESS_INTERVAL) {
+    unsigned long waitTime = SMS_PROCESS_INTERVAL - (millis() - lastSMSProcessTime);
+    Serial.println("⚠️  SMS rate limit, wait " + String(waitTime) + "ms for: " + phone);
+    reportSMSStatus(phone, "FAILED", "Rate limited - try later");
+    return false;
+  }
+  
+  // Send immediately
+  Serial.println("📤 SENDING IMMEDIATE SMS to: " + phone);
+  return sendSMSImmediate(phone, text);
 }
 
 bool sendSMSImmediate(String phone, String text) {
+  // Set processing flag
+  isProcessingSMS = true;
+  lastSMSProcessTime = millis();
+  
+  // Simplified memory safety check
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < 15000) { // Conservative 15KB threshold
+    Serial.println("❌ INSUFFICIENT MEMORY for SMS sending: " + String(freeHeap) + " bytes");
+    reportSMSStatus(phone, "FAILED", "Low memory");
+    isProcessingSMS = false;
+    return false;
+  }
+  
+  // Validate input lengths
+  if (phone.length() > 20 || text.length() > 160) {
+    Serial.println("❌ STRING TOO LONG - Phone: " + String(phone.length()) + ", Text: " + String(text.length()));
+    reportSMSStatus(phone, "FAILED", "Message too long");
+    isProcessingSMS = false;
+    return false;
+  }
+  
+  Serial.println("📤 SENDING SMS to: " + phone);
+  Serial.println("📝 Message: \"" + text + "\"");
+  Serial.println("💾 Free heap: " + String(freeHeap) + " bytes");
   
   // Enhanced pre-checks before sending SMS
   Serial.println("Performing pre-send checks...");
+  Serial.println("📊 Memory status: " + String(freeHeap) + " bytes free");
   
-  // Check if SIM800L is responding
-  if (!checkSIM800Status()) {
-    reportSMSStatus(phone, "FAILED", "SIM800L not responding");
+  // Feed watchdog during long operation
+  yield();
+  
+  // Try-catch equivalent for AT commands
+  bool simOK = false;
+  for (int retry = 0; retry < 3; retry++) {
+    if (checkSIM800Status()) {
+      simOK = true;
+      break;
+    }
+    Serial.println("⚠️  SIM800L check failed, retry " + String(retry + 1) + "/3");
+    delay(1000);
+    yield();
+  }
+  
+  if (!simOK) {
+    reportSMSStatus(phone, "FAILED", "SIM800L not responding after retries");
     return false;
   }
   
@@ -613,14 +605,19 @@ bool sendSMSImmediate(String phone, String text) {
   
   Serial.println("✅ Pre-checks passed, sending SMS...");
   
+  // Feed watchdog before critical section
+  yield();
+  
   // Set text mode
   sim800.println("AT+CMGF=1");
   delay(500);
   
-  // Check response
+  // Check response with timeout safety
   String response = "";
-  while (sim800.available()) {
+  unsigned long responseStart = millis();
+  while (sim800.available() && (millis() - responseStart < 2000)) {
     response += (char)sim800.read();
+    yield(); // Prevent watchdog timeout
   }
   
   if (response.indexOf("OK") == -1) {
@@ -628,34 +625,87 @@ bool sendSMSImmediate(String phone, String text) {
     return false;
   }
   
-  // Send SMS command
+  // Send SMS command with error handling
+  Serial.println("📡 Sending AT+CMGS command...");
   sim800.print("AT+CMGS=\"");
   sim800.print(phone);
   sim800.println("\"");
+  delay(1000); // Increased delay for stability
+  
+  // Wait for '>' prompt with timeout
+  unsigned long promptStart = millis();
+  bool promptReceived = false;
+  while (millis() - promptStart < 5000) { // 5 second timeout
+    if (sim800.available()) {
+      char c = sim800.read();
+      if (c == '>') {
+        promptReceived = true;
+        break;
+      }
+    }
+    yield();
+    delay(10);
+  }
+  
+  if (!promptReceived) {
+    reportSMSStatus(phone, "FAILED", "No SMS prompt received");
+    return false;
+  }
+  
+  Serial.println("📝 Sending message content...");
+  // Send message content with character-by-character approach for safety
+  for (unsigned int i = 0; i < text.length(); i++) {
+    sim800.write(text.charAt(i));
+    if (i % 20 == 0) yield(); // Yield every 20 characters
+  }
+  sim800.println(); // Send newline
   delay(500);
   
-  // Send message content
-  sim800.println(text);
-  delay(500);
-  
-  // Send Ctrl+Z to finish
+  // Send Ctrl+Z to finish with enhanced safety
+  Serial.println("📤 Finalizing SMS with Ctrl+Z...");
   sim800.write(26);
-  delay(5000);      // wait for response
+  delay(8000); // Increased wait time for response
 
+  // Read response with enhanced safety and memory protection
   response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
+  responseStart = millis();
+  int charCount = 0;
+  while (sim800.available() && (millis() - responseStart < 15000)) { // 15 second timeout
+    char c = (char)sim800.read();
+    response += c;
+    charCount++;
+    
+    // Memory protection - limit response size more aggressively
+    if (charCount > 300) {
+      Serial.println("⚠️  Response size limit reached, truncating...");
+      break;
+    }
+    
+    // Yield more frequently during response reading
+    if (charCount % 10 == 0) {
+      yield();
+    }
+    
+    // Check for early success indicators
+    if (response.indexOf("+CMGS:") != -1) {
+      Serial.println("✅ Early success detection");
+      break;
+    }
   }
 
   Serial.println("SIM800L response: " + response);
+  
+  // Feed watchdog before status processing
+  yield();
 
   // Report status back to server via MQTT
   if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
-    Serial.println("SMS sent successfully!");
+    Serial.println("✅ SMS SENT SUCCESSFULLY to " + phone);
     reportSMSStatus(phone, "SENT", "");
+    isProcessingSMS = false;
     return true;
   } else {
-    Serial.println("Failed to send SMS.");
+    Serial.println("❌ SMS FAILED to " + phone);
     String errorMsg = "Unknown Error";
     
     if (response.indexOf("ERROR") != -1) {
@@ -678,6 +728,7 @@ bool sendSMSImmediate(String phone, String text) {
     }
     
     reportSMSStatus(phone, "FAILED", errorMsg);
+    isProcessingSMS = false;
     return false;
   }
 }
@@ -691,9 +742,15 @@ void reportSMSStatus(String phone, String status, String errorMsg) {
   
   if (client.connected()) {
     client.publish("sms/status", statusMessage.c_str());
-    Serial.println("Status reported: " + statusMessage);
+    if (status == "SENT") {
+      Serial.println("📊 STATUS REPORTED: ✅ " + phone + " - SENT");
+    } else if (status == "FAILED") {
+      Serial.println("📊 STATUS REPORTED: ❌ " + phone + " - FAILED" + (errorMsg.length() > 0 ? " (" + errorMsg + ")" : ""));
+    } else {
+      Serial.println("📊 STATUS REPORTED: " + statusMessage);
+    }
   } else {
-    Serial.println("MQTT not connected, couldn't report status");
+    Serial.println("⚠️  MQTT not connected, couldn't report status for " + phone);
   }
 }
 
@@ -745,7 +802,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     msg += (char)payload[i];
   }
 
-  Serial.println("Message received: " + msg);
+  Serial.println("📨 MQTT MESSAGE RECEIVED: " + msg);
 
   // Expected format: phone|message
   int sep = msg.indexOf('|');
@@ -753,16 +810,18 @@ void callback(char* topic, byte* payload, unsigned int length) {
     String phone = msg.substring(0, sep);
     String text = msg.substring(sep + 1);
     
-    Serial.println("Attempting to queue SMS to: " + phone);
+    Serial.println("📥 SMS REQUEST for: " + phone);
+    Serial.println("📝 Message: \"" + text + "\"");
+    
     bool success = sendSMS(phone, text);
     
     if (success) {
-      Serial.println("SMS added to queue successfully. Queue size: " + String(queueSize));
+      Serial.println("✅ SMS ACCEPTED FOR SENDING");
     } else {
-      Serial.println("SMS failed to queue (queue may be full)");
+      Serial.println("❌ SMS REJECTED (rate limited or busy)");
     }
   } else {
-    Serial.println("Invalid message format. Use phone|message");
+    Serial.println("❌ INVALID MESSAGE FORMAT. Use phone|message");
   }
 }
 
@@ -820,14 +879,37 @@ void setup() {
   Serial.println("Setup complete. Ready to receive SMS commands via MQTT and monitor incoming SMS.");
 }
 
+// Safety monitoring function
+void monitorSystemHealth() {
+  // Feed watchdog timer more frequently
+  if (millis() - lastWatchdogFeed > WATCHDOG_INTERVAL) {
+    lastWatchdogFeed = millis();
+    // Feed watchdog (yield to prevent crashes)
+    yield();
+  }
+  
+  // Check free heap memory
+  if (millis() - freeHeapCheckTime > HEAP_CHECK_INTERVAL) {
+    freeHeapCheckTime = millis();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 15000) { // Less than 15KB free
+      Serial.println("⚠️  LOW MEMORY WARNING: " + String(freeHeap) + " bytes free");
+      // Force garbage collection when no SMS is processing
+      if (!isProcessingSMS) {
+        delay(100);
+      }
+    }
+  }
+}
+
 void loop() {
+  // Safety monitoring first
+  monitorSystemHealth();
+  
   if (!client.connected()) {
     reconnect();
   }
   client.loop();
-  
-  // Process SMS queue (most important for bulk SMS)
-  processSMSQueue();
   
   // Check for immediate SMS notifications (real-time)
   checkSMSNotifications();
@@ -839,5 +921,5 @@ void loop() {
   checkForIncomingSMS();
   
   // Small delay to prevent overwhelming the system
-  delay(100);
+  delay(150); // Increased delay for stability
 }
