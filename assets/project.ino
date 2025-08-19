@@ -737,7 +737,7 @@ void periodicSIMCheck() {
   
   // Removed regular status messages to reduce logging noise
 }
-}
+
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg = "";
