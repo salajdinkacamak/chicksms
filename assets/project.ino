@@ -22,6 +22,21 @@ const int SIM800_BAUD = 9600;
 unsigned long lastSMSCheck = 0;
 const unsigned long SMS_CHECK_INTERVAL = 10000; // Check for new SMS every 10 seconds
 
+// --- SMS QUEUE MANAGEMENT ---
+struct SMSMessage {
+  String phoneNumber;
+  String message;
+};
+
+const int MAX_QUEUE_SIZE = 10;
+SMSMessage smsQueue[MAX_QUEUE_SIZE];
+int queueHead = 0;
+int queueTail = 0;
+int queueSize = 0;
+bool isProcessingSMS = false;
+unsigned long lastSMSProcessTime = 0;
+const unsigned long SMS_PROCESS_INTERVAL = 3000; // Process one SMS every 3 seconds
+
 // --- MQTT CLIENT ---
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -380,9 +395,7 @@ void checkForIncomingSMS() {
   }
   lastSMSCheck = millis();
   
-  Serial.println("🔍 Checking for incoming SMS...");
-  
-  // List all unread SMS
+  // List all unread SMS (silent check)
   sim800.println("AT+CMGL=\"REC UNREAD\"");
   delay(2000);
   
@@ -391,16 +404,14 @@ void checkForIncomingSMS() {
     response += (char)sim800.read();
   }
   
-  Serial.println("SMS Check Response: " + response);
-  
+  // Only log if there are actual messages or errors
   if (response.length() > 0 && response.indexOf("+CMGL:") != -1) {
     Serial.println("📨 Found unread SMS, processing...");
     processSMSList(response);
-  } else if (response.length() > 0) {
-    Serial.println("ℹ️  No unread SMS found");
-  } else {
+  } else if (response.length() == 0) {
     Serial.println("⚠️  No response from SIM800L for SMS check");
   }
+  // Removed the "No unread SMS found" message to reduce logging
 }
 
 void processSMSList(String smsData) {
@@ -498,8 +509,72 @@ void deleteSMS(String index) {
   Serial.println("Deleted SMS at index: " + index);
 }
 
+// SMS Queue Management Functions
+bool addToSMSQueue(String phone, String text) {
+  if (queueSize >= MAX_QUEUE_SIZE) {
+    Serial.println("⚠️  SMS Queue is full, dropping message");
+    reportSMSStatus(phone, "FAILED", "Queue full");
+    return false;
+  }
+  
+  smsQueue[queueTail].phoneNumber = phone;
+  smsQueue[queueTail].message = text;
+  queueTail = (queueTail + 1) % MAX_QUEUE_SIZE;
+  queueSize++;
+  
+  Serial.println("📥 Added SMS to queue. Queue size: " + String(queueSize));
+  return true;
+}
+
+bool getFromSMSQueue(String &phone, String &text) {
+  if (queueSize == 0) {
+    return false;
+  }
+  
+  phone = smsQueue[queueHead].phoneNumber;
+  text = smsQueue[queueHead].message;
+  queueHead = (queueHead + 1) % MAX_QUEUE_SIZE;
+  queueSize--;
+  
+  Serial.println("📤 Retrieved SMS from queue. Queue size: " + String(queueSize));
+  return true;
+}
+
+void processSMSQueue() {
+  // Check if we should process the next SMS
+  if (isProcessingSMS || queueSize == 0) {
+    return;
+  }
+  
+  // Check if enough time has passed since last SMS
+  if (millis() - lastSMSProcessTime < SMS_PROCESS_INTERVAL) {
+    return;
+  }
+  
+  String phone, text;
+  if (getFromSMSQueue(phone, text)) {
+    isProcessingSMS = true;
+    lastSMSProcessTime = millis();
+    
+    Serial.println("🚀 Processing queued SMS to: " + phone);
+    bool success = sendSMSImmediate(phone, text);
+    
+    if (success) {
+      Serial.println("✅ Queued SMS sent successfully");
+    } else {
+      Serial.println("❌ Queued SMS failed to send");
+    }
+    
+    isProcessingSMS = false;
+  }
+}
+
 bool sendSMS(String phone, String text) {
-  Serial.println("Sending SMS to: " + phone);
+  // Add to queue instead of sending immediately during bulk operations
+  return addToSMSQueue(phone, text);
+}
+
+bool sendSMSImmediate(String phone, String text) {
   
   // Enhanced pre-checks before sending SMS
   Serial.println("Performing pre-send checks...");
@@ -632,9 +707,7 @@ void periodicSIMCheck() {
   }
   lastSIMCheck = millis();
   
-  Serial.println("\n--- Periodic SIM Status Check ---");
-  
-  // Quick SIM card check
+  // Quick SIM card check (silent unless there's an issue)
   sim800.println("AT+CPIN?");
   delay(1000);
   String simResponse = "";
@@ -642,14 +715,12 @@ void periodicSIMCheck() {
     simResponse += (char)sim800.read();
   }
   
-  if (simResponse.indexOf("READY") != -1) {
-    Serial.println("✅ SIM card: Ready");
-  } else {
+  if (simResponse.indexOf("READY") == -1) {
     Serial.println("❌ SIM card: Not ready - " + simResponse);
     return;
   }
   
-  // Quick network check
+  // Quick network check (silent unless there's an issue)
   sim800.println("AT+CREG?");
   delay(1000);
   String networkResponse = "";
@@ -657,18 +728,15 @@ void periodicSIMCheck() {
     networkResponse += (char)sim800.read();
   }
   
-  if (networkResponse.indexOf("+CREG: 0,1") != -1) {
-    Serial.println("✅ Network: Registered (Home)");
-  } else if (networkResponse.indexOf("+CREG: 0,5") != -1) {
-    Serial.println("✅ Network: Registered (Roaming)");
-  } else {
+  if (networkResponse.indexOf("+CREG: 0,1") == -1 && networkResponse.indexOf("+CREG: 0,5") == -1) {
     Serial.println("❌ Network: Not registered - " + networkResponse);
   }
   
-  // Quick signal check
-  getSignalStrength();
+  // Only log signal strength issues, not regular status
+  // getSignalStrength(); // Commented out to reduce logging
   
-  Serial.println("--- End SIM Status Check ---\n");
+  // Removed regular status messages to reduce logging noise
+}
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -685,13 +753,13 @@ void callback(char* topic, byte* payload, unsigned int length) {
     String phone = msg.substring(0, sep);
     String text = msg.substring(sep + 1);
     
-    Serial.println("Attempting to send SMS to: " + phone);
+    Serial.println("Attempting to queue SMS to: " + phone);
     bool success = sendSMS(phone, text);
     
     if (success) {
-      Serial.println("SMS delivery completed successfully");
+      Serial.println("SMS added to queue successfully. Queue size: " + String(queueSize));
     } else {
-      Serial.println("SMS delivery failed");
+      Serial.println("SMS failed to queue (queue may be full)");
     }
   } else {
     Serial.println("Invalid message format. Use phone|message");
@@ -757,6 +825,9 @@ void loop() {
     reconnect();
   }
   client.loop();
+  
+  // Process SMS queue (most important for bulk SMS)
+  processSMSQueue();
   
   // Check for immediate SMS notifications (real-time)
   checkSMSNotifications();

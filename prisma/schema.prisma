@@ -66,6 +66,7 @@ model LoginAttempt {
 
 enum SmsStatus {
   PENDING
+  QUEUED
   SENT
   FAILED
   RETRY

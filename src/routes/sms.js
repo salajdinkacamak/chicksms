@@ -6,7 +6,7 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 const prisma = new PrismaClient();
-const DELAY_BETWEEN_MESSAGES  = 10000; // 10 seconds
+const DELAY_BETWEEN_MESSAGES  = 10000; // 10 seconds - safe delay to avoid carrier blocking
 
 // Send SMS endpoint
 router.post('/send', authMiddleware, async (req, res) => {
@@ -168,6 +168,93 @@ router.get('/status/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// Get bulk SMS status summary
+router.get('/bulk-status', authMiddleware, async (req, res) => {
+  try {
+    const { userId, timeframe = '1h' } = req.query;
+    
+    // Calculate time filter
+    const now = new Date();
+    let timeFilter;
+    
+    switch (timeframe) {
+      case '1h':
+        timeFilter = new Date(now.getTime() - 60 * 60 * 1000);
+        break;
+      case '24h':
+        timeFilter = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        break;
+      case '7d':
+        timeFilter = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        timeFilter = new Date(now.getTime() - 60 * 60 * 1000);
+    }
+
+    // Build where clause
+    const whereClause = {
+      createdAt: {
+        gte: timeFilter
+      }
+    };
+
+    // If specific user requested (admin only feature)
+    if (userId && req.user.role === 'admin') {
+      whereClause.userId = userId;
+    } else {
+      whereClause.userId = req.user.id;
+    }
+
+    // Get status summary
+    const statusSummary = await prisma.smsLog.groupBy({
+      by: ['status'],
+      where: whereClause,
+      _count: {
+        status: true
+      }
+    });
+
+    // Get recent SMS logs
+    const recentSMS = await prisma.smsLog.findMany({
+      where: whereClause,
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true,
+        phoneNumber: true,
+        status: true,
+        createdAt: true,
+        sentAt: true,
+        errorMsg: true
+      }
+    });
+
+    // Format summary
+    const summary = {
+      total: 0,
+      queued: 0,
+      pending: 0,
+      sent: 0,
+      failed: 0
+    };
+
+    statusSummary.forEach(item => {
+      summary.total += item._count.status;
+      summary[item.status.toLowerCase()] = item._count.status;
+    });
+
+    res.json({
+      timeframe,
+      summary,
+      recentSMS
+    });
+
+  } catch (error) {
+    logger.error('Get bulk SMS status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Bulk SMS endpoint
 router.post('/bulk', authMiddleware, async (req, res) => {
   try {
@@ -183,15 +270,18 @@ router.post('/bulk', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    if (recipients.length > 100) {
+    if (recipients.length > 50) {
       return res.status(400).json({ 
-        error: 'Maximum 100 recipients allowed per bulk request' 
+        error: 'Maximum 50 recipients allowed per bulk request to prevent overwhelming the system' 
       });
     }
 
     const results = [];
     const phoneRegex = /^\+?[1-9]\d{1,14}$/;
+    let processedCount = 0;
 
+    // First, validate all phone numbers and create database entries
+    const validRecipients = [];
     for (const phoneNumber of recipients) {
       if (!phoneRegex.test(phoneNumber.replace(/[\s\-\(\)]/g, ''))) {
         results.push({
@@ -208,72 +298,112 @@ router.post('/bulk', authMiddleware, async (req, res) => {
           data: {
             phoneNumber,
             message,
-            status: 'PENDING',
+            status: 'QUEUED', // Changed from PENDING to QUEUED
             userId: req.user.id
           }
         });
 
-        // Send via MQTT
-        const mqttMessage = `${phoneNumber}|${message}`;
-        const success = await mqttService.publishMessage(mqttMessage);
+        validRecipients.push({
+          phoneNumber,
+          smsId: smsLog.id
+        });
 
-        if (success) {
-          await prisma.smsLog.update({
-            where: { id: smsLog.id },
-            data: { 
-              status: 'SENT',
-              sentAt: new Date()
-            }
-          });
-
-          results.push({
-            phoneNumber,
-            status: 'SENT',
-            smsId: smsLog.id
-          });
-        } else {
-          await prisma.smsLog.update({
-            where: { id: smsLog.id },
-            data: { 
-              status: 'FAILED',
-              errorMsg: 'Failed to publish to MQTT broker'
-            }
-          });
-
-          results.push({
-            phoneNumber,
-            status: 'FAILED',
-            smsId: smsLog.id,
-            error: 'Failed to queue SMS'
-          });
-        }
-
-        // Add small delay between messages to avoid overwhelming
-        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_MESSAGES));
+        results.push({
+          phoneNumber,
+          status: 'QUEUED',
+          smsId: smsLog.id
+        });
 
       } catch (error) {
-        logger.error(`Bulk SMS error for ${phoneNumber}:`, error);
+        logger.error(`Failed to create SMS log for ${phoneNumber}:`, error);
         results.push({
           phoneNumber,
           status: 'FAILED',
-          error: 'Internal error'
+          error: 'Database error'
         });
       }
     }
 
-    const successCount = results.filter(r => r.status === 'SENT').length;
-    const failureCount = results.length - successCount;
+    // Send response immediately after queuing all messages
+    const queuedCount = validRecipients.length;
+    const failedCount = results.filter(r => r.status === 'FAILED').length;
 
-    logger.info(`Bulk SMS completed: ${successCount} sent, ${failureCount} failed`);
+    logger.info(`Bulk SMS queued: ${queuedCount} messages queued, ${failedCount} failed validation`);
 
     res.json({
-      message: 'Bulk SMS completed',
+      message: 'Bulk SMS queued for processing',
       summary: {
-        total: results.length,
-        sent: successCount,
-        failed: failureCount
+        total: recipients.length,
+        queued: queuedCount,
+        failed: failedCount
       },
-      results
+      results,
+      note: 'Messages are being processed in background. Check status endpoint for updates.'
+    });
+
+    // Process messages in background without blocking the response
+    setImmediate(async () => {
+      logger.info(`Starting background processing of ${queuedCount} SMS messages`);
+      
+      for (const recipient of validRecipients) {
+        try {
+          // Update status to PENDING before sending
+          await prisma.smsLog.update({
+            where: { id: recipient.smsId },
+            data: { 
+              status: 'PENDING',
+              updatedAt: new Date()
+            }
+          });
+
+          // Send via MQTT
+          const mqttMessage = `${recipient.phoneNumber}|${message}`;
+          const success = await mqttService.publishMessage(mqttMessage);
+
+          if (success) {
+            await prisma.smsLog.update({
+              where: { id: recipient.smsId },
+              data: { 
+                status: 'SENT',
+                sentAt: new Date()
+              }
+            });
+            logger.info(`SMS sent to ${recipient.phoneNumber} (ID: ${recipient.smsId})`);
+          } else {
+            await prisma.smsLog.update({
+              where: { id: recipient.smsId },
+              data: { 
+                status: 'FAILED',
+                errorMsg: 'Failed to publish to MQTT broker'
+              }
+            });
+            logger.error(`Failed to send SMS to ${recipient.phoneNumber} (ID: ${recipient.smsId})`);
+          }
+
+          processedCount++;
+          
+          // Add delay between messages to prevent overwhelming the ESP32
+          if (processedCount < queuedCount) {
+            await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_MESSAGES));
+          }
+
+        } catch (error) {
+          logger.error(`Background processing error for ${recipient.phoneNumber}:`, error);
+          try {
+            await prisma.smsLog.update({
+              where: { id: recipient.smsId },
+              data: { 
+                status: 'FAILED',
+                errorMsg: 'Background processing error'
+              }
+            });
+          } catch (dbError) {
+            logger.error(`Failed to update SMS status in database:`, dbError);
+          }
+        }
+      }
+
+      logger.info(`Bulk SMS background processing completed: ${processedCount}/${queuedCount} processed`);
     });
 
   } catch (error) {
