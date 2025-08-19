@@ -6,7 +6,7 @@ const logger = require('../utils/logger');
 
 const router = express.Router();
 const prisma = new PrismaClient();
-const DELAY_BETWEEN_MESSAGES  = 12000; // 12 seconds - safe delay to prevent Arduino overwhelm and carrier blocking
+const DELAY_BETWEEN_MESSAGES  = 20000; // 20 seconds - safe delay to prevent Arduino overwhelm and carrier blocking
 
 // Send SMS endpoint
 router.post('/send', authMiddleware, async (req, res) => {
