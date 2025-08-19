@@ -42,20 +42,14 @@ router.post('/send', authMiddleware, async (req, res) => {
     const success = await mqttService.publishMessage(mqttMessage);
 
     if (success) {
-      await prisma.smsLog.update({
-        where: { id: smsLog.id },
-        data: { 
-          status: 'SENT',
-          sentAt: new Date()
-        }
-      });
-
+      // Keep status as PENDING until Arduino confirms delivery
       logger.info(`SMS queued for sending: ${phoneNumber}`);
       
       res.json({
         message: 'SMS queued for sending',
         smsId: smsLog.id,
-        status: 'SENT'
+        status: 'PENDING',
+        note: 'Status will update to SENT when Arduino confirms delivery'
       });
     } else {
       await prisma.smsLog.update({
@@ -108,18 +102,17 @@ router.post('/retry/:id', authMiddleware, async (req, res) => {
       await prisma.smsLog.update({
         where: { id },
         data: { 
-          status: 'SENT',
-          sentAt: new Date(),
+          status: 'PENDING', // Reset to PENDING, will be updated by Arduino confirmation
           retryCount: smsLog.retryCount + 1,
           errorMsg: null
         }
       });
 
-      logger.info(`SMS retry successful: ${smsLog.phoneNumber}`);
+      logger.info(`SMS retry queued: ${smsLog.phoneNumber}`);
       
       res.json({
-        message: 'SMS retry successful',
-        status: 'SENT'
+        message: 'SMS retry queued, waiting for Arduino confirmation',
+        status: 'PENDING'
       });
     } else {
       await prisma.smsLog.update({
@@ -258,7 +251,7 @@ router.get('/bulk-status', authMiddleware, async (req, res) => {
 // Bulk SMS endpoint
 router.post('/bulk', authMiddleware, async (req, res) => {
   try {
-    const { recipients, message } = req.body;
+    const { recipients, message, delaySeconds } = req.body;
 
     if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
       return res.status(400).json({ 
@@ -270,17 +263,20 @@ router.post('/bulk', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    if (recipients.length > 50) {
+    if (recipients.length > 100) {
       return res.status(400).json({ 
-        error: 'Maximum 50 recipients allowed per bulk request to prevent overwhelming the system' 
+        error: 'Maximum 100 recipients allowed per bulk request to prevent overwhelming the system' 
       });
     }
 
+    // Use custom delay if provided, otherwise use the default DELAY_BETWEEN_MESSAGES
+    const delay = delaySeconds 
+      ? Math.max(5, Math.min(delaySeconds, 60)) * 1000 // Min 5 sec, Max 60 sec if custom
+      : DELAY_BETWEEN_MESSAGES; // Use default 20 seconds
     const results = [];
     const phoneRegex = /^\+?[1-9]\d{1,14}$/;
-    let processedCount = 0;
 
-    // First, validate all phone numbers and create database entries
+    // Validate all phone numbers and create database entries
     const validRecipients = [];
     for (const phoneNumber of recipients) {
       if (!phoneRegex.test(phoneNumber.replace(/[\s\-\(\)]/g, ''))) {
@@ -298,7 +294,7 @@ router.post('/bulk', authMiddleware, async (req, res) => {
           data: {
             phoneNumber,
             message,
-            status: 'QUEUED', // Changed from PENDING to QUEUED
+            status: 'QUEUED',
             userId: req.user.id
           }
         });
@@ -324,96 +320,103 @@ router.post('/bulk', authMiddleware, async (req, res) => {
       }
     }
 
-    // Send response immediately after queuing all messages
     const queuedCount = validRecipients.length;
     const failedCount = results.filter(r => r.status === 'FAILED').length;
+    const estimatedDuration = Math.ceil((queuedCount * delay) / 1000 / 60); // in minutes
 
-    logger.info(`Bulk SMS queued: ${queuedCount} messages queued, ${failedCount} failed validation`);
+    logger.info(`Bulk SMS queued: ${queuedCount} messages, ${failedCount} failed, ${delay/1000}s delay, ~${estimatedDuration}min duration`);
 
+    // Send immediate response
     res.json({
-      message: 'Bulk SMS queued for processing',
+      message: 'Bulk SMS queued for background processing',
       summary: {
         total: recipients.length,
         queued: queuedCount,
-        failed: failedCount
+        failed: failedCount,
+        delayBetweenSMS: `${delay/1000} seconds`,
+        estimatedDuration: `${estimatedDuration} minutes`
       },
       results,
-      note: 'Messages are being processed in background with 12-second intervals. Check status endpoint for updates.'
+      note: 'All SMS are being processed individually in background. Check status endpoint for real-time updates.'
     });
 
-    // Process messages in background without blocking the response
-    setImmediate(async () => {
-      logger.info(`Starting background processing of ${queuedCount} SMS messages with 12-second intervals`);
-      
-      for (let i = 0; i < validRecipients.length; i++) {
-        const recipient = validRecipients[i];
-        try {
-          // Update status to PENDING before sending
-          await prisma.smsLog.update({
-            where: { id: recipient.smsId },
-            data: { 
-              status: 'PENDING',
-              updatedAt: new Date()
-            }
-          });
-
-          logger.info(`Processing SMS ${i + 1}/${queuedCount} to ${recipient.phoneNumber}`);
-
-          // Send via MQTT - Arduino expects individual SMS
-          const mqttMessage = `${recipient.phoneNumber}|${message}`;
-          const success = await mqttService.publishMessage(mqttMessage);
-
-          if (success) {
-            await prisma.smsLog.update({
-              where: { id: recipient.smsId },
-              data: { 
-                status: 'SENT',
-                sentAt: new Date()
-              }
-            });
-            logger.info(`✅ SMS sent to ${recipient.phoneNumber} (${i + 1}/${queuedCount})`);
-          } else {
-            await prisma.smsLog.update({
-              where: { id: recipient.smsId },
-              data: { 
-                status: 'FAILED',
-                errorMsg: 'Failed to publish to MQTT broker'
-              }
-            });
-            logger.error(`❌ Failed to send SMS to ${recipient.phoneNumber} (${i + 1}/${queuedCount})`);
-          }
-
-          processedCount++;
-          
-          // Add 12-second delay between messages (except after the last one)
-          if (i < validRecipients.length - 1) {
-            logger.info(`⏳ Waiting 12 seconds before next SMS (${processedCount}/${queuedCount} completed)`);
-            await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_MESSAGES));
-          }
-
-        } catch (error) {
-          logger.error(`Background processing error for ${recipient.phoneNumber}:`, error);
-          try {
-            await prisma.smsLog.update({
-              where: { id: recipient.smsId },
-              data: { 
-                status: 'FAILED',
-                errorMsg: 'Background processing error: ' + error.message
-              }
-            });
-          } catch (dbError) {
-            logger.error(`Failed to update SMS status in database:`, dbError);
-          }
-        }
-      }
-
-      logger.info(`🎉 Bulk SMS background processing completed: ${processedCount}/${queuedCount} processed successfully`);
-    });
+    // Start background thread for SMS processing
+    processBulkSMSInBackground(validRecipients, message, delay);
 
   } catch (error) {
     logger.error('Bulk SMS error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Background SMS processing function
+async function processBulkSMSInBackground(recipients, message, delay) {
+  const startTime = new Date();
+  const totalCount = recipients.length;
+  
+  logger.info(`🚀 Starting background SMS processing: ${totalCount} messages with ${delay/1000}s delays`);
+  
+  for (let i = 0; i < recipients.length; i++) {
+    const recipient = recipients[i];
+    const currentNumber = i + 1;
+    
+    try {
+      // Update status to PENDING
+      await prisma.smsLog.update({
+        where: { id: recipient.smsId },
+        data: { 
+          status: 'PENDING',
+          updatedAt: new Date()
+        }
+      });
+
+      logger.info(`📱 Processing SMS ${currentNumber}/${totalCount} to ${recipient.phoneNumber}`);
+
+      // Send individual SMS via MQTT
+      const mqttMessage = `${recipient.phoneNumber}|${message}`;
+      const success = await mqttService.publishMessage(mqttMessage);
+
+      if (success) {
+        // Keep status as PENDING until Arduino confirms delivery
+        logger.info(`✅ SMS ${currentNumber}/${totalCount} queued to ${recipient.phoneNumber} - waiting for Arduino confirmation`);
+      } else {
+        await prisma.smsLog.update({
+          where: { id: recipient.smsId },
+          data: { 
+            status: 'FAILED',
+            errorMsg: 'Failed to publish to MQTT broker'
+          }
+        });
+        logger.error(`❌ SMS ${currentNumber}/${totalCount} failed for ${recipient.phoneNumber}`);
+      }
+
+      // Wait before next SMS (except for the last one)
+      if (i < recipients.length - 1) {
+        logger.info(`⏳ Waiting ${delay/1000}s before next SMS (${currentNumber}/${totalCount} completed)`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+
+    } catch (error) {
+      logger.error(`💥 Error processing SMS ${currentNumber}/${totalCount} for ${recipient.phoneNumber}:`, error);
+      
+      try {
+        await prisma.smsLog.update({
+          where: { id: recipient.smsId },
+          data: { 
+            status: 'FAILED',
+            errorMsg: `Processing error: ${error.message}`
+          }
+        });
+      } catch (dbError) {
+        logger.error(`Database update error for ${recipient.phoneNumber}:`, dbError);
+      }
+    }
+  }
+
+  const endTime = new Date();
+  const totalDuration = Math.ceil((endTime - startTime) / 1000 / 60);
+  
+  logger.info(`🎉 Background SMS processing completed! ${totalCount} messages processed in ${totalDuration} minutes`);
+}
 
 module.exports = router;

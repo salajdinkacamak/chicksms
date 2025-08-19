@@ -1,8 +1,28 @@
+# ChickSMS Docker Compose Configuration
+# 
+# This file contains multiple service profiles for different environments:
+#
+# Usage:
+# - Development:     docker-compose --profile dev up
+# - Debug mode:      docker-compose --profile debug up
+# - Production:      docker-compose --profile prod up
+# - Database only:   docker-compose --profile db-only up
+#
+# Environment variables can be set in .env file:
+# - MYSQL_PORT (default: 3307)
+# - MQTT_PORT (default: 1883)
+# - MQTT_WS_PORT (default: 9001)
+# - PHPMYADMIN_PORT (default: 8080)
+# - DATABASE_URL (for production)
+# - JWT_SECRET (for production)
+# - MQTT_BROKER_URL (for production)
+
 version: '3.8'
 
 services:
-  # ChickSMS Application
+  # ChickSMS Application - Development
   chicksms:
+    profiles: ["dev", "development"]
     build: 
       context: .
       dockerfile: Dockerfile
@@ -16,23 +36,87 @@ services:
       - JWT_EXPIRE=7d
       - MQTT_BROKER_URL=mqtt://mosquitto:1883
       - MQTT_TOPIC=test/topic
-      - MQTT_CLIENT_ID=chicksms-server
+      - MQTT_CLIENT_ID=ChickSMS-Server-Docker
       - LOG_LEVEL=info
       - RATE_LIMIT_WINDOW_MS=900000
       - RATE_LIMIT_MAX_REQUESTS=100
     depends_on:
       mysql:
         condition: service_healthy
-      mosquitto:
-        condition: service_started
     restart: unless-stopped
     volumes:
       - ./logs:/app/logs
     networks:
       - chicksms-network
 
+  # ChickSMS Application - Debug Mode
+  chicksms-debug:
+    profiles: ["debug"]
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "9229:9229"  # Debug port
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - DATABASE_URL=mysql://chicksms:chicksms_password@mysql:3306/chicksms
+      - JWT_SECRET=5b07b68ddae41758085c6ead07419b40eaa40a138e94c0985fc58091bf82383198f4fc060429cb85ffcf3db02656cdb9324718ded4c041fde7fd8c9f43aac610
+      - JWT_EXPIRE=7d
+      - MQTT_BROKER_URL=mqtt://mosquitto:1883
+      - MQTT_TOPIC=test/topic
+      - MQTT_CLIENT_ID=ChickSMS-Server-Docker-Debug
+      - LOG_LEVEL=debug
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+    command: ["node", "--inspect=0.0.0.0:9229", "src/server.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - ./src:/app/src  # Live code updates
+      - ./prisma:/app/prisma
+    networks:
+      - chicksms-network
+
+  # ChickSMS Application - Production
+  chicksms-prod:
+    profiles: ["prod", "production"]
+    build: 
+      context: .
+      dockerfile: Dockerfile.prod
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DATABASE_URL=${DATABASE_URL:-mysql://chicksms:chicksms_password@mysql:3306/chicksms}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_EXPIRE=7d
+      - MQTT_BROKER_URL=${MQTT_BROKER_URL:-mqtt://mosquitto:1883}
+      - MQTT_TOPIC=test/topic
+      - MQTT_CLIENT_ID=chicksms-server-prod
+      - LOG_LEVEL=warn
+      - RATE_LIMIT_WINDOW_MS=900000
+      - RATE_LIMIT_MAX_REQUESTS=100
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - chicksms-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.chicksms.rule=Host(`sms.yourdomain.com`)"
+      - "traefik.http.routers.chicksms.tls=true"
+      - "traefik.http.routers.chicksms.tls.certresolver=letsencrypt"
+
   # MySQL Database
   mysql:
+    profiles: ["dev", "development", "debug", "prod", "production", "db-only"]
     image: mysql:8.0
     environment:
       - MYSQL_ROOT_PASSWORD=root_password
@@ -40,7 +124,7 @@ services:
       - MYSQL_USER=chicksms
       - MYSQL_PASSWORD=chicksms_password
     ports:
-      - "3307:3306"  # Use different port to avoid conflict with local MySQL
+      - "${MYSQL_PORT:-3307}:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     restart: unless-stopped
@@ -53,10 +137,11 @@ services:
 
   # MQTT Broker
   mosquitto:
+    profiles: ["dev", "development", "debug", "prod", "production"]
     image: eclipse-mosquitto:2.0
     ports:
-      - "1884:1883"  # Use different port to avoid conflict
-      - "9002:9001"
+      - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_WS_PORT:-9001}:9001"
     volumes:
       - ./mosquitto/config:/mosquitto/config
       - mosquitto_data:/mosquitto/data
@@ -65,19 +150,9 @@ services:
     networks:
       - chicksms-network
 
-  # Redis (optional, for future caching needs)
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6380:6379"  # Use different port to avoid conflict
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    networks:
-      - chicksms-network
-
   # phpMyAdmin (for database management)
   phpmyadmin:
+    profiles: ["dev", "development", "debug", "db-only"]
     image: phpmyadmin:latest
     environment:
       - PMA_HOST=mysql
@@ -85,7 +160,7 @@ services:
       - PMA_PASSWORD=chicksms_password
       - PMA_PORT=3306
     ports:
-      - "8081:80"  # Use different port to avoid conflict
+      - "${PHPMYADMIN_PORT:-8080}:80"
     depends_on:
       - mysql
     restart: unless-stopped
@@ -96,7 +171,6 @@ volumes:
   mysql_data:
   mosquitto_data:
   mosquitto_log:
-  redis_data:
 
 networks:
   chicksms-network:

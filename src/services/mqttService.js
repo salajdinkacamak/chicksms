@@ -14,8 +14,8 @@ class MqttService {
 
   connect() {
     try {
-      const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtt://localhost:1883';
-      const clientId = process.env.MQTT_CLIENT_ID || 'chicksms-server';
+      const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtt://95.217.15.58:1883';
+      const clientId = process.env.MQTT_CLIENT_ID || 'ChickSMS-Server';
 
       logger.info(`Connecting to MQTT broker: ${brokerUrl}`);
 
@@ -31,6 +31,11 @@ class MqttService {
         logger.info('Connected to MQTT broker');
         this.isConnected = true;
         this.reconnectAttempts = 0;
+
+        //debug this. If im getting any messages from the Arduino
+        this.client.on('message', (topic, message) => {
+          logger.info(`Received message on topic ${topic}: ${message.toString()}`);
+        });
 
         // Subscribe to incoming SMS topic if needed
         const incomingTopic = 'sms/incoming';
@@ -142,11 +147,11 @@ class MqttService {
         logger.info(`Received SMS status update for ${phoneNumber}: ${status}${errorMsg ? ` (${errorMsg})` : ''}`);
 
         try {
-          // Find the most recent SMS to this phone number that's pending or sent
+          // Find the most recent SMS to this phone number that's not yet confirmed
           const smsLog = await prisma.smsLog.findFirst({
             where: {
               phoneNumber,
-              status: { in: ['PENDING', 'RETRY', 'SENT'] }
+              status: { in: ['PENDING', 'RETRY', 'QUEUED'] } // Include QUEUED for bulk SMS
             },
             orderBy: { createdAt: 'desc' }
           });
@@ -171,7 +176,7 @@ class MqttService {
 
             logger.info(`Updated SMS status for ${phoneNumber}: ${status} (SMS ID: ${smsLog.id})`);
           } else {
-            logger.warn(`No pending SMS found for phone number: ${phoneNumber}`);
+            logger.warn(`No pending SMS found for phone number: ${phoneNumber} - may have already been processed`);
           }
         } catch (error) {
           logger.error('Failed to update SMS status:', error);

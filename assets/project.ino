@@ -306,38 +306,39 @@ void manualSMSCheck() {
 
 // Alternative method to check for new SMS using +CNMI
 void checkSMSNotifications() {
-  // Check if there's any immediate data from SIM800L (SMS notifications)
-  if (sim800.available()) {
-    String notification = "";
-    while (sim800.available()) {
-      notification += (char)sim800.read();
-    }
-    
-    Serial.println("📬 SIM800L Notification: " + notification);
-    
-    // Check if it's an SMS notification (+CMTI: "SM",index)
-    if (notification.indexOf("+CMTI:") != -1) {
-      Serial.println("📨 New SMS notification received!");
-      
-      // Extract the SMS index
-      int indexStart = notification.lastIndexOf(",");
-      if (indexStart != -1) {
-        String smsIndex = notification.substring(indexStart + 1);
-        smsIndex.trim();
-        Serial.println("📍 Reading SMS at index: " + smsIndex);
-        
-        // Read the specific SMS
-        sim800.println("AT+CMGR=" + smsIndex);
-        delay(2000);
-        
-        String smsContent = "";
-        while (sim800.available()) {
-          smsContent += (char)sim800.read();
+  static String buffer = "";
+  while (sim800.available()) {
+    char c = sim800.read();
+    if (c == '\n' || c == '\r') {
+      if (buffer.length() > 0) {
+        Serial.println("📬 SIM800L Line: " + buffer);
+
+        // Handle +CMTI (new SMS)
+        if (buffer.startsWith("+CMTI:")) {
+          int idx = buffer.lastIndexOf(',');
+          if (idx != -1) {
+            String smsIndex = buffer.substring(idx + 1);
+            smsIndex.trim();
+            Serial.println("📍 New SMS at index: " + smsIndex);
+            sim800.println("AT+CMGR=" + smsIndex);
+          }
         }
-        
-        Serial.println("📄 SMS Content: " + smsContent);
-        processSpecificSMS(smsContent, smsIndex);
+
+        // Handle +CMGR (read SMS content)
+        else if (buffer.startsWith("+CMGR:")) {
+          // Next lines will contain the SMS text, so read them
+          delay(500);
+          String smsContent = "";
+          while (sim800.available()) {
+            smsContent += (char)sim800.read();
+          }
+          Serial.println("📄 SMS Content: " + smsContent);
+        }
+
+        buffer = "";
       }
+    } else {
+      buffer += c;
     }
   }
 }
