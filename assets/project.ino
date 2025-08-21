@@ -1,926 +1,678 @@
+/*************************************************************
+ * ChickSMS — ESP32 + SIM800L + MQTT (Hardened Version)
+ * Partition: Huge APP (3MB no OTA) / 1MB SPIFFS (optional)
+ * Keeps your functionality; improves stability & parsing.
+ *************************************************************/
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <HardwareSerial.h>
+#include "esp_task_wdt.h"
 
-// --- WIFI SETTINGS ---
-const char* ssid = "ITP Coworking";
-const char* password = "1nnovation";
+// ---------------- WIFI SETTINGS ----------------
+const char* ssid           = "ITP Coworking";
+const char* password       = "1nnovation";
 
-// --- MQTT SETTINGS ---
-const char* mqtt_server = "95.217.15.58"; // your PC Mosquitto IP
-const int mqtt_port = 1883;
-const char* mqtt_topic = "test/topic";
-const char* mqtt_username = ""; // Leave empty if no auth required
-const char* mqtt_password = ""; // Leave empty if no auth required
+// ---------------- MQTT SETTINGS ----------------
+const char* mqtt_server    = "95.217.15.58";
+const int   mqtt_port      = 1883;
+const char* mqtt_topic     = "test/topic";      // inbound control (phone|message)
+const char* mqtt_username  = "";                // leave empty if no auth
+const char* mqtt_password  = "";
 const char* mqtt_client_id = "ESP32-ChickSMS-Client";
 
-// --- SIM800L SETTINGS ---
-HardwareSerial sim800(2); // use UART2 (RX=16, TX=17)
+// ---------------- SIM800L SETTINGS -------------
+HardwareSerial sim800(2);        // UART2
+const int SIM800_RX = 16;        // ESP32 RX <- SIM800 TX
+const int SIM800_TX = 17;        // ESP32 TX -> SIM800 RX
 const int SIM800_BAUD = 9600;
 
-// --- SMS READING VARIABLES ---
-unsigned long lastSMSCheck = 0;
-const unsigned long SMS_CHECK_INTERVAL = 10000; // Check for new SMS every 10 seconds
+// ---------------- TIMERS / INTERVALS -----------
+unsigned long lastSMSCheck       = 0;
+const unsigned long SMS_CHECK_INTERVAL = 10000;   // 10s
 
-// --- SIMPLE SMS MANAGEMENT ---
+unsigned long lastSIMCheck       = 0;
+const unsigned long SIM_CHECK_INTERVAL = 60000;   // 60s
+
+unsigned long lastHeapCheck      = 0;
+const unsigned long HEAP_CHECK_INTERVAL = 30000;  // 30s
+
+unsigned long lastWDTFeed        = 0;
+const unsigned long WDT_FEED_INTERVAL = 900;      // ~1s
+
+// SMS send rate-limit
 bool isProcessingSMS = false;
 unsigned long lastSMSProcessTime = 0;
-const unsigned long SMS_PROCESS_INTERVAL = 10000; // 10 seconds between SMS for safety
+const unsigned long SMS_PROCESS_INTERVAL = 10000; // 10s
 
-// --- SAFETY MEASURES ---
-unsigned long lastWatchdogFeed = 0;
-const unsigned long WATCHDOG_INTERVAL = 1000; // Feed watchdog every second
-unsigned long freeHeapCheckTime = 0;
-const unsigned long HEAP_CHECK_INTERVAL = 30000; // Check heap every 30 seconds
-
-// --- MQTT CLIENT ---
+// ---------------- MQTT CLIENT ------------------
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// --- FUNCTIONS ---
+// ---------------- RESPONSE BUFFERS -------------
+// Keep these modest to avoid memory spikes
+static char  respBuf[512];     // general responses
+static char  lineBuf[256];     // line reads
+
+// ---------------- HELPERS (TIME) ---------------
+static inline unsigned long nowMs() { return millis(); }
+
+int mqtConnectFailureCount = 0;
+
+// ---------------- SERIAL / AT HELPERS ----------
+
+void feedWDT() {
+  unsigned long t = nowMs();
+  if (t - lastWDTFeed > WDT_FEED_INTERVAL) {
+    lastWDTFeed = t;
+    esp_task_wdt_reset();
+    // yield() not strictly needed when WDT is fed here
+  }
+}
+
+void simFlush(unsigned long ms = 30) {
+  unsigned long tEnd = nowMs() + ms;
+  while (nowMs() < tEnd) {
+    while (sim800.available()) (void)sim800.read();
+    delay(1);
+  }
+}
+
+void safeDelay(unsigned long ms) {
+  unsigned long tEnd = nowMs() + ms;
+  while (nowMs() < tEnd) {
+    feedWDT();
+    delay(1);
+  }
+}
+
+// read bytes until timeout or buffer full; returns length
+size_t readBytesWithTimeout(char* buf, size_t maxLen, unsigned long timeoutMs) {
+  size_t idx = 0;
+  unsigned long tEnd = nowMs() + timeoutMs;
+  while (nowMs() < tEnd && idx + 1 < maxLen) {
+    while (sim800.available()) {
+      buf[idx++] = (char)sim800.read();
+      if (idx + 1 >= maxLen) break;
+    }
+    if (!sim800.available()) delay(1);
+    feedWDT();
+  }
+  buf[idx] = '\0';
+  return idx;
+}
+
+// waits for any of the tokens in 'needles' to appear in stream within timeout
+// also collects into respBuf (capped). Returns index of matched needle or -1
+int waitForAny(const char* needles[], int nNeedles, unsigned long timeoutMs, char* out, size_t outCap) {
+  size_t idx = 0;
+  unsigned long tEnd = nowMs() + timeoutMs;
+  while (nowMs() < tEnd && idx + 1 < outCap) {
+    while (sim800.available()) {
+      char c = (char)sim800.read();
+      out[idx++] = c;
+      out[idx] = '\0';
+      // check each token quickly (short tokens)
+      for (int i = 0; i < nNeedles; i++) {
+        if (strstr(out, needles[i]) != nullptr) {
+          return i;
+        }
+      }
+      if (idx + 1 >= outCap) break;
+    }
+    if (!sim800.available()) delay(1);
+    feedWDT();
+  }
+  return -1;
+}
+
+bool waitForPrompt(unsigned long timeoutMs = 5000) {
+  const char* needles[] = {">", "ERROR", "NO CARRIER", "BUSY"};
+  simFlush(5);
+  int got = waitForAny(needles, 4, timeoutMs, respBuf, sizeof(respBuf));
+  // Success only if '>' arrived
+  return (got == 0);
+}
+
+// Sends AT cmd + CRLF and (optionally) waits for OK/ERROR
+// Returns true if "OK" seen (or "CMGS" if expectCMGS), false on ERROR or timeout
+bool sendAT(const char* cmd, unsigned long waitMs = 2000, bool expectCMGS = false) {
+  simFlush(3);
+  sim800.println(cmd);
+  const char* okNeedles[] = { "OK", "ERROR", "+CMS ERROR", "+CME ERROR", "+CMGS:" };
+  int got = waitForAny(okNeedles, 5, waitMs, respBuf, sizeof(respBuf));
+
+  if (got == -1) return false;
+  if (expectCMGS) {
+    // treat "+CMGS:" as success, even if OK not yet appended
+    if (got == 4) return true;
+  }
+  // treat OK as success, errors as fail
+  if (got == 0) return true;
+  return false;
+}
+
+// Trim helpers for Arduino String (used sparingly)
+String trimQuotes(const String& s) {
+  int a = s.indexOf('\"');
+  int b = s.lastIndexOf('\"');
+  if (a >= 0 && b > a) return s.substring(a+1, b);
+  return s;
+}
+
+// ---------------- WIFI / MQTT -------------------
 
 void setup_wifi() {
-  delay(100);
   Serial.println();
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(ssid);
-
+  Serial.printf("Connecting to Wi-Fi: %s\n", ssid);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  unsigned long tEnd = nowMs() + 20000; // 20s
+  while (WiFi.status() != WL_CONNECTED && nowMs() < tEnd) {
+    delay(250);
     Serial.print(".");
+    feedWDT();
   }
-
-  Serial.println();
-  Serial.println("Wi-Fi connected!");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-bool checkSIM800Status() {
-  sim800.println("AT");
-  delay(1000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  if (response.indexOf("OK") != -1) {
-    Serial.println("SIM800L is ready");
-    return true;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
   } else {
-    Serial.println("SIM800L not responding");
-    return false;
+    Serial.println("\nWi-Fi connect timeout (continuing, will retry in loop)");
   }
 }
 
-bool checkSIMCard() {
-  Serial.println("Checking SIM card status...");
-  
-  // Check if SIM card is inserted
-  sim800.println("AT+CPIN?");
-  delay(2000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  Serial.println("SIM Status Response: " + response);
-  
-  if (response.indexOf("READY") != -1) {
-    Serial.println("✅ SIM card is ready");
-    return true;
-  } else if (response.indexOf("SIM PIN") != -1) {
-    Serial.println("❌ SIM card requires PIN");
-    return false;
-  } else if (response.indexOf("SIM PUK") != -1) {
-    Serial.println("❌ SIM card is PUK locked");
-    return false;
-  } else if (response.indexOf("NOT INSERTED") != -1) {
-    Serial.println("❌ SIM card not inserted");
-    return false;
-  } else {
-    Serial.println("❌ Unknown SIM card status");
-    return false;
-  }
-}
-
-bool checkNetworkRegistration() {
-  Serial.println("Checking network registration...");
-  
-  // Check network registration status
-  sim800.println("AT+CREG?");
-  delay(2000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  Serial.println("Network Registration Response: " + response);
-  
-  // Parse +CREG response
-  // +CREG: n,stat where stat: 0=not searching, 1=registered(home), 2=searching, 3=denied, 5=registered(roaming)
-  if (response.indexOf("+CREG: 0,1") != -1) {
-    Serial.println("✅ Registered on home network");
-    return true;
-  } else if (response.indexOf("+CREG: 0,5") != -1) {
-    Serial.println("✅ Registered on roaming network");
-    return true;
-  } else if (response.indexOf("+CREG: 0,2") != -1) {
-    Serial.println("🔍 Searching for network...");
-    return false;
-  } else if (response.indexOf("+CREG: 0,3") != -1) {
-    Serial.println("❌ Network registration denied");
-    return false;
-  } else if (response.indexOf("+CREG: 0,0") != -1) {
-    Serial.println("❌ Not searching for network");
-    return false;
-  } else {
-    Serial.println("❌ Unknown network registration status");
-    return false;
-  }
-}
-
-String getNetworkOperator() {
-  Serial.println("Getting network operator info...");
-  
-  // Get current operator
-  sim800.println("AT+COPS?");
-  delay(2000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  Serial.println("Operator Response: " + response);
-  
-  // Extract operator name from +COPS: 0,0,"OperatorName" format
-  int startQuote = response.indexOf("\"");
-  if (startQuote != -1) {
-    int endQuote = response.indexOf("\"", startQuote + 1);
-    if (endQuote != -1) {
-      String operator_name = response.substring(startQuote + 1, endQuote);
-      Serial.println("📡 Network Operator: " + operator_name);
-      return operator_name;
-    }
-  }
-  
-  Serial.println("❌ Could not get operator info");
-  return "Unknown";
-}
-
-String getSignalStrength() {
-  Serial.println("Checking signal strength...");
-  
-  // Get signal quality
-  sim800.println("AT+CSQ");
-  delay(1000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  Serial.println("Signal Response: " + response);
-  
-  // Parse +CSQ: rssi,ber response
-  int csqIndex = response.indexOf("+CSQ: ");
-  if (csqIndex != -1) {
-    int commaIndex = response.indexOf(",", csqIndex);
-    if (commaIndex != -1) {
-      String rssiStr = response.substring(csqIndex + 6, commaIndex);
-      int rssi = rssiStr.toInt();
-      
-      String signalQuality;
-      if (rssi == 99) {
-        signalQuality = "No signal";
-      } else if (rssi >= 20) {
-        signalQuality = "Excellent";
-      } else if (rssi >= 15) {
-        signalQuality = "Good";
-      } else if (rssi >= 10) {
-        signalQuality = "Fair";
-      } else if (rssi >= 5) {
-        signalQuality = "Poor";
-      } else {
-        signalQuality = "Very Poor";
-      }
-      
-      String result = signalQuality + " (RSSI: " + rssi + ")";
-      Serial.println("📶 Signal Strength: " + result);
-      return result;
-    }
-  }
-  
-  Serial.println("❌ Could not get signal strength");
-  return "Unknown";
-}
-
-bool performFullSIMCheck() {
-  Serial.println("\n=== SIM800L Comprehensive Check ===");
-  
-  // Step 1: Basic AT command
-  if (!checkSIM800Status()) {
-    Serial.println("❌ FAILED: SIM800L not responding to AT commands");
-    return false;
-  }
-  
-  // Step 2: SIM card check
-  if (!checkSIMCard()) {
-    Serial.println("❌ FAILED: SIM card issue");
-    return false;
-  }
-  
-  // Step 3: Network registration
-  int attempts = 0;
-  while (attempts < 10) {
-    if (checkNetworkRegistration()) {
-      break;
-    }
-    attempts++;
-    Serial.println("Waiting for network registration... (" + String(attempts) + "/10)");
-    delay(3000);
-  }
-  
-  if (attempts >= 10) {
-    Serial.println("❌ FAILED: Could not register on network");
-    return false;
-  }
-  
-  // Step 4: Get network info
-  getNetworkOperator();
-  getSignalStrength();
-  
-  Serial.println("✅ SUCCESS: SIM800L is fully operational");
-  Serial.println("====================================\n");
-  
-  return true;
-}
-
-void setupSMSMode() {
-  Serial.println("Setting up SMS mode...");
-  
-  // Set SMS to text mode
-  sim800.println("AT+CMGF=1");
-  delay(500);
-  
-  // Set SMS storage to SIM card
-  sim800.println("AT+CPMS=\"SM\",\"SM\",\"SM\"");
-  delay(500);
-  
-  // Enable SMS notifications
-  sim800.println("AT+CNMI=1,2,0,0,0");
-  delay(500);
-  
-  Serial.println("SMS mode configured");
-}
-
-// Manual SMS check function for testing
-void manualSMSCheck() {
-  Serial.println("\n=== Manual SMS Check ===");
-  
-  // Check all SMS (read and unread)
-  sim800.println("AT+CMGL=\"ALL\"");
-  delay(3000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  Serial.println("All SMS Response: " + response);
-  
-  if (response.indexOf("+CMGL:") != -1) {
-    Serial.println("📨 Found SMS messages:");
-    processSMSList(response);
-  } else {
-    Serial.println("📭 No SMS messages found");
-  }
-  
-  Serial.println("=== End Manual Check ===\n");
-}
-
-// Alternative method to check for new SMS using +CNMI
-void checkSMSNotifications() {
-  static String buffer = "";
-  while (sim800.available()) {
-    char c = sim800.read();
-    if (c == '\n' || c == '\r') {
-      if (buffer.length() > 0) {
-        Serial.println("📬 SIM800L Line: " + buffer);
-
-        // Handle +CMTI (new SMS)
-        if (buffer.startsWith("+CMTI:")) {
-          int idx = buffer.lastIndexOf(',');
-          if (idx != -1) {
-            String smsIndex = buffer.substring(idx + 1);
-            smsIndex.trim();
-            Serial.println("📍 New SMS at index: " + smsIndex);
-            sim800.println("AT+CMGR=" + smsIndex);
-          }
-        }
-
-        // Handle +CMGR (read SMS content)
-        else if (buffer.startsWith("+CMGR:")) {
-          // Next lines will contain the SMS text, so read them
-          delay(500);
-          String smsContent = "";
-          while (sim800.available()) {
-            smsContent += (char)sim800.read();
-          }
-          Serial.println("📄 SMS Content: " + smsContent);
-        }
-
-        buffer = "";
-      }
-    } else {
-      buffer += c;
-    }
-  }
-}
-
-// Process a specific SMS read by AT+CMGR
-void processSpecificSMS(String smsContent, String smsIndex) {
-  Serial.println("🔍 Processing specific SMS...");
-  
-  if (smsContent.indexOf("+CMGR:") == -1) {
-    Serial.println("❌ Invalid SMS content");
-    return;
-  }
-  
-  // Extract phone number
-  int quote1 = smsContent.indexOf("\"");
-  int quote2 = smsContent.indexOf("\"", quote1 + 1);
-  
-  if (quote1 == -1 || quote2 == -1) {
-    Serial.println("❌ Could not extract phone number");
-    return;
-  }
-  
-  String phoneNumber = smsContent.substring(quote1 + 1, quote2);
-  
-  // Extract message (after the timestamp line)
-  int messageStart = smsContent.indexOf("\n");
-  messageStart = smsContent.indexOf("\n", messageStart + 1);
-  
-  if (messageStart == -1) {
-    Serial.println("❌ Could not find message content");
-    return;
-  }
-  
-  String message = smsContent.substring(messageStart + 1);
-  message.trim();
-  message.replace("\"", "");
-  
-  Serial.println("📞 From: " + phoneNumber);
-  Serial.println("💬 Message: " + message);
-  
-  if (phoneNumber.length() > 0 && message.length() > 0) {
-    reportIncomingSMS(phoneNumber, message);
-    deleteSMS(smsIndex);
-  }
-}
-
-void checkForIncomingSMS() {
-  // Check if it's time to check for SMS
-  if (millis() - lastSMSCheck < SMS_CHECK_INTERVAL) {
-    return;
-  }
-  lastSMSCheck = millis();
-  
-  // List all unread SMS (silent check)
-  sim800.println("AT+CMGL=\"REC UNREAD\"");
-  delay(2000);
-  
-  String response = "";
-  while (sim800.available()) {
-    response += (char)sim800.read();
-  }
-  
-  // Only log if there are actual messages or errors
-  if (response.length() > 0 && response.indexOf("+CMGL:") != -1) {
-    Serial.println("📨 Found unread SMS, processing...");
-    processSMSList(response);
-  } else if (response.length() == 0) {
-    Serial.println("⚠️  No response from SIM800L for SMS check");
-  }
-  // Removed the "No unread SMS found" message to reduce logging
-}
-
-void processSMSList(String smsData) {
-  Serial.println("📋 Processing SMS data: " + smsData);
-  int startIndex = 0;
-  int smsCount = 0;
-  
-  while (true) {
-    int cmglIndex = smsData.indexOf("+CMGL:", startIndex);
-    if (cmglIndex == -1) break;
-    
-    smsCount++;
-    Serial.println("📱 Processing SMS #" + String(smsCount));
-    
-    // Extract SMS index
-    int commaIndex1 = smsData.indexOf(",", cmglIndex);
-    if (commaIndex1 == -1) {
-      Serial.println("❌ Could not find first comma in SMS data");
-      break;
-    }
-    
-    String smsIndex = smsData.substring(cmglIndex + 7, commaIndex1);
-    smsIndex.trim();
-    Serial.println("📍 SMS Index: " + smsIndex);
-    
-    // Extract phone number (between quotes)
-    int quote1 = smsData.indexOf("\"", commaIndex1 + 1);
-    int quote2 = smsData.indexOf("\"", quote1 + 1);
-    if (quote1 == -1 || quote2 == -1) {
-      Serial.println("❌ Could not find phone number quotes");
-      break;
-    }
-    
-    String phoneNumber = smsData.substring(quote1 + 1, quote2);
-    Serial.println("📞 Phone Number: " + phoneNumber);
-    
-    // Find the message content (after the date line)
-    int dateEnd = smsData.indexOf("\n", quote2);
-    int messageStart = smsData.indexOf("\n", dateEnd + 1);
-    int messageEnd = smsData.indexOf("\n", messageStart + 1);
-    
-    if (messageStart == -1) {
-      Serial.println("❌ Could not find message start");
-      break;
-    }
-    if (messageEnd == -1) messageEnd = smsData.length();
-    
-    String message = smsData.substring(messageStart + 1, messageEnd);
-    message.trim();
-    
-    // Remove any remaining quotes or special characters
-    message.replace("\"", "");
-    
-    Serial.println("💬 Message Content: " + message);
-    
-    if (phoneNumber.length() > 0 && message.length() > 0) {
-      Serial.println("✅ Valid SMS found, reporting and deleting...");
-      reportIncomingSMS(phoneNumber, message);
-      deleteSMS(smsIndex);
-    } else {
-      Serial.println("❌ Invalid SMS data - phone: " + phoneNumber + ", message: " + message);
-    }
-    
-    startIndex = messageEnd;
-  }
-  
-  if (smsCount == 0) {
-    Serial.println("ℹ️  No SMS found in response");
-  } else {
-    Serial.println("✅ Processed " + String(smsCount) + " SMS messages");
-  }
-}
-
-void reportIncomingSMS(String phoneNumber, String message) {
-  Serial.println("Incoming SMS from: " + phoneNumber);
-  Serial.println("Message: " + message);
-  
-  // Report to server via MQTT
-  // Expected format: phoneNumber|message|timestamp
-  String timestamp = String(millis()); // Simple timestamp
-  String incomingMessage = phoneNumber + "|" + message + "|" + timestamp;
-  
+void reportSMSStatus(const String& phone, const String& status, const String& errorMsg) {
+  String statusMessage = phone + "|" + status;
+  if (errorMsg.length() > 0) statusMessage += "|" + errorMsg;
   if (client.connected()) {
-    client.publish("sms/incoming", incomingMessage.c_str());
-    Serial.println("Incoming SMS reported to server: " + incomingMessage);
+    client.publish("sms/status", statusMessage.c_str());
+    if (status == "SENT") {
+      Serial.printf("📊 STATUS REPORTED: ✅ %s - SENT\n", phone.c_str());
+    } else if (status == "FAILED") {
+      Serial.printf("📊 STATUS REPORTED: ❌ %s - FAILED (%s)\n", phone.c_str(), errorMsg.c_str());
+    } else {
+      Serial.printf("📊 STATUS REPORTED: %s\n", statusMessage.c_str());
+    }
+  } else {
+    Serial.printf("⚠️  MQTT not connected, couldn't report status for %s\n", phone.c_str());
+  }
+}
+
+void reportIncomingSMS(const String& phoneNumber, const String& message) {
+  String payload = phoneNumber + "|" + message + "|" + String(millis());
+  Serial.printf("Incoming SMS from: %s\nMessage: %s\n", phoneNumber.c_str(), message.c_str());
+  if (client.connected()) {
+    client.publish("sms/incoming", payload.c_str());
+    Serial.println("Incoming SMS reported to server.");
   } else {
     Serial.println("MQTT not connected, couldn't report incoming SMS");
   }
 }
 
-void deleteSMS(String index) {
-  // Delete the SMS after processing
-  sim800.println("AT+CMGD=" + index);
-  delay(500);
-  Serial.println("Deleted SMS at index: " + index);
+void reconnect() {
+  if (client.connected()) return;
+  Serial.print("Attempting MQTT connection...");
+  bool connected = false;
+  if (strlen(mqtt_username) > 0 && strlen(mqtt_password) > 0) {
+    connected = client.connect(mqtt_client_id, mqtt_username, mqtt_password);
+    Serial.print(" with auth...");
+  } else {
+    connected = client.connect(mqtt_client_id);
+    Serial.print(" without auth...");
+  }
+
+  if (connected) {
+    Serial.println("connected");
+    client.subscribe(mqtt_topic);
+    Serial.println(String("Subscribed to: ") + mqtt_topic);
+    mqtConnectFailureCount = 0; // Reset failure counter on successful connection
+  } else {
+    Serial.print("failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" (will retry)");
+  }
 }
 
-// Simple SMS Management Functions - No Queue
-bool sendSMS(String phone, String text) {
-  // Check if we can send SMS now
+// ---------------- SIM / NETWORK CHECKS ---------
+
+bool checkSIM800Alive() {
+  return sendAT("AT", 800);
+}
+
+bool checkSIMReady() {
+  if (!sendAT("AT+CPIN?", 1500)) return false;
+  // respBuf contains last response
+  return strstr(respBuf, "READY") != nullptr;
+}
+
+bool checkNetworkRegistered() {
+  if (!sendAT("AT+CREG?", 1500)) return false;
+  // Expect +CREG: n,stat  where stat=1 (home) or 5 (roaming)
+  if (strstr(respBuf, "+CREG:") == nullptr) return false;
+  if (strstr(respBuf, ",1") || strstr(respBuf, ", 1")) return true;
+  if (strstr(respBuf, ",5") || strstr(respBuf, ", 5")) return true;
+  return false;
+}
+
+void getOperatorIfAny() {
+  if (sendAT("AT+COPS?", 2000)) {
+    Serial.printf("Operator Response: %s\n", respBuf);
+  }
+}
+
+void getSignalIfAny() {
+  if (sendAT("AT+CSQ", 1200)) {
+    Serial.printf("Signal Response: %s\n", respBuf);
+  }
+}
+
+bool performFullSIMCheck() {
+  Serial.println("\n=== SIM800L Comprehensive Check ===");
+  if (!checkSIM800Alive()) {
+    Serial.println("❌ FAILED: SIM800L not responding to AT");
+    return false;
+  }
+  if (!checkSIMReady()) {
+    Serial.println("❌ FAILED: SIM not READY");
+    return false;
+  }
+  // attempt up to 10 times for registration
+  for (int i = 0; i < 10; i++) {
+    if (checkNetworkRegistered()) break;
+    Serial.printf("Waiting for network registration... (%d/10)\n", i+1);
+    safeDelay(3000);
+  }
+  if (!checkNetworkRegistered()) {
+    Serial.println("❌ FAILED: Not registered to network");
+    return false;
+  }
+  getOperatorIfAny();
+  getSignalIfAny();
+  Serial.println("✅ SUCCESS: SIM800L is fully operational");
+  Serial.println("====================================\n");
+  return true;
+}
+
+void setupSMSMode() {
+  Serial.println("Setting up SMS mode...");
+  sendAT("AT+CMGF=1", 1500);                   // text mode
+  sendAT("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1500);// SIM storage
+  sendAT("AT+CNMI=1,2,0,0,0", 1500);           // new SMS indications
+  Serial.println("SMS mode configured");
+}
+
+// ---------------- SMS SENDING -------------------
+
+bool sendSMSImmediate(const String& phone, const String& text) {
+  isProcessingSMS = true; // set early; always clear on exit
+
+  auto finallyClear = []() {
+    isProcessingSMS = false;
+  };
+
+  // basic memory check
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < 15000) {
+    Serial.printf("❌ INSUFFICIENT MEMORY: %lu bytes\n", (unsigned long)freeHeap);
+    reportSMSStatus(phone, "FAILED", "Low memory");
+    finallyClear();
+    return false;
+  }
+
+  if (phone.length() > 20 || text.length() > 160) {
+    Serial.printf("❌ STRING TOO LONG - Phone: %d, Text: %d\n", phone.length(), text.length());
+    reportSMSStatus(phone, "FAILED", "Message too long");
+    finallyClear();
+    return false;
+  }
+
+  Serial.printf("📤 SENDING SMS to: %s\n📝 \"%s\"\n💾 Free heap: %lu bytes\n",
+                phone.c_str(), text.c_str(), (unsigned long)freeHeap);
+
+  reportSMSStatus(phone, "SENDING", "");
+
+  // Robust pre-checks
+  bool alive = false;
+  for (int r = 0; r < 3; r++) {
+    if (checkSIM800Alive()) { alive = true; break; }
+    Serial.printf("⚠️  SIM800L check failed, retry %d/3\n", r+1);
+    safeDelay(400);
+  }
+  if (!alive) {
+    reportSMSStatus(phone, "FAILED", "SIM800L no AT");
+    finallyClear();
+    return false;
+  }
+
+  if (!checkSIMReady()) {
+    reportSMSStatus(phone, "FAILED", "SIM not ready");
+    finallyClear();
+    return false;
+  }
+  if (!checkNetworkRegistered()) {
+    reportSMSStatus(phone, "FAILED", "Not registered");
+    finallyClear();
+    return false;
+  }
+
+  // Set text mode
+  if (!sendAT("AT+CMGF=1", 1500)) {
+    reportSMSStatus(phone, "FAILED", "CMGF fail");
+    finallyClear();
+    return false;
+  }
+
+  // AT+CMGS
+  {
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "AT+CMGS=\"%s\"", phone.c_str());
+    simFlush(3);
+    sim800.println(cmd);
+    if (!waitForPrompt(5000)) {
+      reportSMSStatus(phone, "FAILED", "No '>' prompt");
+      finallyClear();
+      return false;
+    }
+  }
+
+  // send content and Ctrl+Z
+  sim800.print(text);
+  sim800.print("\r");   // newline
+  safeDelay(200);
+  sim800.write(26);     // Ctrl+Z
+  // Wait for +CMGS/OK/ERROR (SIM can take time)
+  const char* needles[] = { "+CMGS:", "OK", "ERROR", "+CMS ERROR" };
+  int got = waitForAny(needles, 4, 15000, respBuf, sizeof(respBuf));
+  Serial.printf("SIM800L response: %s\n", respBuf);
+
+  if (got == 0 || got == 1) { // +CMGS or OK
+    reportSMSStatus(phone, "SENT", "");
+    finallyClear();
+    return true;
+  }
+
+  String err = "Unknown";
+  if (got == 2) err = "ERROR";
+  else if (got == 3) {
+    // try to extract code
+    char* p = strstr(respBuf, "+CMS ERROR:");
+    if (p) {
+      p += 11;
+      while (*p == ' ') p++;
+      String code = "";
+      while (*p && *p != '\r' && *p != '\n') { code += *p; p++; }
+      err = "CMS " + code;
+    } else err = "CMS ERROR";
+  }
+  reportSMSStatus(phone, "FAILED", err);
+  finallyClear();
+  return false;
+}
+
+bool sendSMS(const String& phone, const String& text) {
   if (isProcessingSMS) {
-    Serial.println("⚠️  SMS already in progress, ignoring request for: " + phone);
-    reportSMSStatus(phone, "FAILED", "SMS in progress - try later");
+    Serial.printf("⚠️  SMS already in progress, ignoring: %s\n", phone.c_str());
+    reportSMSStatus(phone, "FAILED", "Busy");
     return false;
   }
-  
-  // Check timing interval
-  if (millis() - lastSMSProcessTime < SMS_PROCESS_INTERVAL) {
-    unsigned long waitTime = SMS_PROCESS_INTERVAL - (millis() - lastSMSProcessTime);
-    Serial.println("⚠️  SMS rate limit, wait " + String(waitTime) + "ms for: " + phone);
-    reportSMSStatus(phone, "FAILED", "Rate limited - try later");
+  if (nowMs() - lastSMSProcessTime < SMS_PROCESS_INTERVAL) {
+    unsigned long waitTime = SMS_PROCESS_INTERVAL - (nowMs() - lastSMSProcessTime);
+    Serial.printf("⚠️  Rate limited, wait %lu ms for: %s\n", waitTime, phone.c_str());
+    reportSMSStatus(phone, "FAILED", "Rate limited");
     return false;
   }
-  
-  // Send immediately
-  Serial.println("📤 SENDING IMMEDIATE SMS to: " + phone);
+  lastSMSProcessTime = nowMs();
   return sendSMSImmediate(phone, text);
 }
 
-bool sendSMSImmediate(String phone, String text) {
-  // Set processing flag
-  isProcessingSMS = true;
-  lastSMSProcessTime = millis();
-  
-  // Simplified memory safety check
-  uint32_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < 15000) { // Conservative 15KB threshold
-    Serial.println("❌ INSUFFICIENT MEMORY for SMS sending: " + String(freeHeap) + " bytes");
-    reportSMSStatus(phone, "FAILED", "Low memory");
-    isProcessingSMS = false;
-    return false;
-  }
-  
-  // Validate input lengths
-  if (phone.length() > 20 || text.length() > 160) {
-    Serial.println("❌ STRING TOO LONG - Phone: " + String(phone.length()) + ", Text: " + String(text.length()));
-    reportSMSStatus(phone, "FAILED", "Message too long");
-    isProcessingSMS = false;
-    return false;
-  }
-  
-  Serial.println("📤 SENDING SMS to: " + phone);
-  Serial.println("📝 Message: \"" + text + "\"");
-  Serial.println("💾 Free heap: " + String(freeHeap) + " bytes");
-  
-  // Enhanced pre-checks before sending SMS
-  Serial.println("Performing pre-send checks...");
-  Serial.println("📊 Memory status: " + String(freeHeap) + " bytes free");
-  
-  // Feed watchdog during long operation
-  yield();
-  
-  // Try-catch equivalent for AT commands
-  bool simOK = false;
-  for (int retry = 0; retry < 3; retry++) {
-    if (checkSIM800Status()) {
-      simOK = true;
-      break;
-    }
-    Serial.println("⚠️  SIM800L check failed, retry " + String(retry + 1) + "/3");
-    delay(1000);
-    yield();
-  }
-  
-  if (!simOK) {
-    reportSMSStatus(phone, "FAILED", "SIM800L not responding after retries");
-    return false;
-  }
-  
-  // Quick check if SIM is still ready
-  sim800.println("AT+CPIN?");
-  delay(1000);
-  String simResponse = "";
-  while (sim800.available()) {
-    simResponse += (char)sim800.read();
-  }
-  
-  if (simResponse.indexOf("READY") == -1) {
-    reportSMSStatus(phone, "FAILED", "SIM card not ready");
-    return false;
-  }
-  
-  // Quick network check
-  sim800.println("AT+CREG?");
-  delay(1000);
-  String networkResponse = "";
-  while (sim800.available()) {
-    networkResponse += (char)sim800.read();
-  }
-  
-  if (networkResponse.indexOf("+CREG: 0,1") == -1 && networkResponse.indexOf("+CREG: 0,5") == -1) {
-    reportSMSStatus(phone, "FAILED", "Not registered on network");
-    return false;
-  }
-  
-  Serial.println("✅ Pre-checks passed, sending SMS...");
-  
-  // Feed watchdog before critical section
-  yield();
-  
-  // Set text mode
-  sim800.println("AT+CMGF=1");
-  delay(500);
-  
-  // Check response with timeout safety
-  String response = "";
-  unsigned long responseStart = millis();
-  while (sim800.available() && (millis() - responseStart < 2000)) {
-    response += (char)sim800.read();
-    yield(); // Prevent watchdog timeout
-  }
-  
-  if (response.indexOf("OK") == -1) {
-    reportSMSStatus(phone, "FAILED", "Failed to set text mode");
-    return false;
-  }
-  
-  // Send SMS command with error handling
-  Serial.println("📡 Sending AT+CMGS command...");
-  sim800.print("AT+CMGS=\"");
-  sim800.print(phone);
-  sim800.println("\"");
-  delay(1000); // Increased delay for stability
-  
-  // Wait for '>' prompt with timeout
-  unsigned long promptStart = millis();
-  bool promptReceived = false;
-  while (millis() - promptStart < 5000) { // 5 second timeout
-    if (sim800.available()) {
-      char c = sim800.read();
-      if (c == '>') {
-        promptReceived = true;
-        break;
-      }
-    }
-    yield();
-    delay(10);
-  }
-  
-  if (!promptReceived) {
-    reportSMSStatus(phone, "FAILED", "No SMS prompt received");
-    return false;
-  }
-  
-  Serial.println("📝 Sending message content...");
-  // Send message content with character-by-character approach for safety
-  for (unsigned int i = 0; i < text.length(); i++) {
-    sim800.write(text.charAt(i));
-    if (i % 20 == 0) yield(); // Yield every 20 characters
-  }
-  sim800.println(); // Send newline
-  delay(500);
-  
-  // Send Ctrl+Z to finish with enhanced safety
-  Serial.println("📤 Finalizing SMS with Ctrl+Z...");
-  sim800.write(26);
-  delay(8000); // Increased wait time for response
+// ---------------- INCOMING SMS ------------------
 
-  // Read response with enhanced safety and memory protection
-  response = "";
-  responseStart = millis();
-  int charCount = 0;
-  while (sim800.available() && (millis() - responseStart < 15000)) { // 15 second timeout
-    char c = (char)sim800.read();
-    response += c;
-    charCount++;
-    
-    // Memory protection - limit response size more aggressively
-    if (charCount > 300) {
-      Serial.println("⚠️  Response size limit reached, truncating...");
-      break;
-    }
-    
-    // Yield more frequently during response reading
-    if (charCount % 10 == 0) {
-      yield();
-    }
-    
-    // Check for early success indicators
-    if (response.indexOf("+CMGS:") != -1) {
-      Serial.println("✅ Early success detection");
-      break;
-    }
+void deleteSMS(const String& index) {
+  char cmd[24];
+  snprintf(cmd, sizeof(cmd), "AT+CMGD=%s", index.c_str());
+  sendAT(cmd, 1000);
+  Serial.printf("Deleted SMS at index: %s\n", index.c_str());
+}
+
+// Parse one +CMGR or +CMGL item
+void processSpecificSMS(const String& smsContent, const String& smsIndex) {
+  Serial.println("🔍 Processing specific SMS...");
+  if (smsContent.indexOf("+CMGR:") == -1 && smsContent.indexOf("+CMGL:") == -1) {
+    Serial.println("❌ Invalid SMS content");
+    return;
   }
 
-  Serial.println("SIM800L response: " + response);
-  
-  // Feed watchdog before status processing
-  yield();
+  // extract phone number "..."
+  int q1 = smsContent.indexOf("\"");
+  int q2 = smsContent.indexOf("\"", q1 + 1);
+  if (q1 == -1 || q2 == -1) {
+    Serial.println("❌ Could not extract phone number");
+    return;
+  }
+  String phoneNumber = smsContent.substring(q1 + 1, q2);
 
-  // Report status back to server via MQTT
-  if (response.indexOf("OK") != -1 || response.indexOf("+CMGS:") != -1) {
-    Serial.println("✅ SMS SENT SUCCESSFULLY to " + phone);
-    reportSMSStatus(phone, "SENT", "");
-    isProcessingSMS = false;
-    return true;
-  } else {
-    Serial.println("❌ SMS FAILED to " + phone);
-    String errorMsg = "Unknown Error";
-    
-    if (response.indexOf("ERROR") != -1) {
-      errorMsg = "AT Command Error";
-    } else if (response.indexOf("NO CARRIER") != -1) {
-      errorMsg = "No Network Connection";
-    } else if (response.indexOf("CMS ERROR") != -1) {
-      // Extract CMS error code if available
-      int cmsIndex = response.indexOf("CMS ERROR:");
-      if (cmsIndex != -1) {
-        String errorCode = response.substring(cmsIndex + 10, cmsIndex + 13);
-        errorMsg = "CMS ERROR " + errorCode;
-      } else {
-        errorMsg = "SMS Service Error";
-      }
-    } else if (response.indexOf("NO DIALTONE") != -1) {
-      errorMsg = "No Signal";
-    } else if (response.length() == 0) {
-      errorMsg = "No Response from SIM800L";
-    }
-    
-    reportSMSStatus(phone, "FAILED", errorMsg);
-    isProcessingSMS = false;
-    return false;
+  // message is after next two line breaks from header line
+  int o = smsContent.indexOf("\n", q2);
+  if (o == -1) { Serial.println("❌ Could not find message start"); return; }
+  o = smsContent.indexOf("\n", o + 1);
+  if (o == -1) { Serial.println("❌ Could not find message start"); return; }
+  String message = smsContent.substring(o + 1);
+  message.trim();
+  message.replace("\"", "");
+
+  if (phoneNumber.length() && message.length()) {
+    reportIncomingSMS(phoneNumber, message);
+    if (smsIndex.length()) deleteSMS(smsIndex);
   }
 }
 
-void reportSMSStatus(String phone, String status, String errorMsg) {
-  // Expected format: phoneNumber|status|error
-  String statusMessage = phone + "|" + status;
-  if (errorMsg.length() > 0) {
-    statusMessage += "|" + errorMsg;
-  }
-  
-  if (client.connected()) {
-    client.publish("sms/status", statusMessage.c_str());
-    if (status == "SENT") {
-      Serial.println("📊 STATUS REPORTED: ✅ " + phone + " - SENT");
-    } else if (status == "FAILED") {
-      Serial.println("📊 STATUS REPORTED: ❌ " + phone + " - FAILED" + (errorMsg.length() > 0 ? " (" + errorMsg + ")" : ""));
-    } else {
-      Serial.println("📊 STATUS REPORTED: " + statusMessage);
+// Process list from AT+CMGL="REC UNREAD" result
+void processSMSList(const String& smsData) {
+  Serial.println("📋 Processing SMS list...");
+  int startIndex = 0;
+  int smsCount = 0;
+
+  while (true) {
+    int cmglIndex = smsData.indexOf("+CMGL:", startIndex);
+    if (cmglIndex == -1) break;
+    smsCount++;
+
+    // index
+    int comma1 = smsData.indexOf(",", cmglIndex);
+    String smsIndex = smsData.substring(cmglIndex + 7, comma1);
+    smsIndex.trim();
+
+    // phone
+    int q1 = smsData.indexOf("\"", comma1 + 1);
+    int q2 = smsData.indexOf("\"", q1 + 1);
+    if (q1 == -1 || q2 == -1) break;
+    String phoneNumber = smsData.substring(q1 + 1, q2);
+
+    // message content
+    int lineEnd = smsData.indexOf("\n", q2);
+    int msgStart = smsData.indexOf("\n", lineEnd + 1);
+    int msgEnd   = smsData.indexOf("\n", msgStart + 1);
+    if (msgStart == -1) break;
+    if (msgEnd == -1) msgEnd = smsData.length();
+    String message = smsData.substring(msgStart + 1, msgEnd);
+    message.trim();
+    message.replace("\"", "");
+
+    if (phoneNumber.length() && message.length()) {
+      reportIncomingSMS(phoneNumber, message);
+      deleteSMS(smsIndex);
     }
+    startIndex = msgEnd;
+  }
+
+  if (smsCount == 0) Serial.println("ℹ️  No SMS found in response");
+  else Serial.printf("✅ Processed %d SMS messages\n", smsCount);
+}
+
+// Poll unread using CMGL (backup)
+void checkForIncomingSMS() {
+  if (nowMs() - lastSMSCheck < SMS_CHECK_INTERVAL) return;
+  lastSMSCheck = nowMs();
+
+  simFlush(3);
+  sim800.println("AT+CMGL=\"REC UNREAD\"");
+  safeDelay(2000);
+  readBytesWithTimeout(respBuf, sizeof(respBuf), 1000);
+  String response = String(respBuf);
+
+  if (response.indexOf("+CMGL:") != -1) {
+    Serial.println("📨 Found unread SMS, processing...");
+    processSMSList(response);
   } else {
-    Serial.println("⚠️  MQTT not connected, couldn't report status for " + phone);
+    Serial.println("… No unread SMS.");
   }
 }
 
-// Periodic SIM status monitoring
-unsigned long lastSIMCheck = 0;
-const unsigned long SIM_CHECK_INTERVAL = 60000; // Check SIM status every 60 seconds
+// Real-time +CNMI notifications
+void checkSMSNotifications() {
+  // Non-blocking peek of UART
+  if (!sim800.available()) return;
+
+  String notification = "";
+  unsigned long tEnd = nowMs() + 100; // short window to collect burst
+  while (nowMs() < tEnd && sim800.available()) {
+    notification += (char)sim800.read();
+    delay(1);
+  }
+  if (notification.length() == 0) return;
+
+  Serial.println("📬 SIM800L Notification:");
+  Serial.println(notification);
+
+  // +CMTI: "SM", index
+  int p = notification.indexOf("+CMTI:");
+  if (p != -1) {
+    int comma = notification.indexOf(",", p);
+    if (comma != -1) {
+      String smsIndex = notification.substring(comma + 1);
+      smsIndex.trim();
+      Serial.println("📍 Reading SMS at index: " + smsIndex);
+
+      char cmd[24];
+      snprintf(cmd, sizeof(cmd), "AT+CMGR=%s", smsIndex.c_str());
+      if (sendAT(cmd, 2000)) {
+        String smsContent = String(respBuf);
+        processSpecificSMS(smsContent, smsIndex);
+      }
+    }
+  }
+}
+
+// ---------------- PERIODIC HEALTH ---------------
 
 void periodicSIMCheck() {
-  if (millis() - lastSIMCheck < SIM_CHECK_INTERVAL) {
-    return;
+  if (nowMs() - lastSIMCheck < SIM_CHECK_INTERVAL) return;
+  lastSIMCheck = nowMs();
+
+  if (!checkSIMReady()) {
+    Serial.printf("❌ SIM card not ready: %s\n", respBuf);
   }
-  lastSIMCheck = millis();
-  
-  // Quick SIM card check (silent unless there's an issue)
-  sim800.println("AT+CPIN?");
-  delay(1000);
-  String simResponse = "";
-  while (sim800.available()) {
-    simResponse += (char)sim800.read();
+  if (!checkNetworkRegistered()) {
+    Serial.printf("❌ Not registered: %s\n", respBuf);
   }
-  
-  if (simResponse.indexOf("READY") == -1) {
-    Serial.println("❌ SIM card: Not ready - " + simResponse);
-    return;
-  }
-  
-  // Quick network check (silent unless there's an issue)
-  sim800.println("AT+CREG?");
-  delay(1000);
-  String networkResponse = "";
-  while (sim800.available()) {
-    networkResponse += (char)sim800.read();
-  }
-  
-  if (networkResponse.indexOf("+CREG: 0,1") == -1 && networkResponse.indexOf("+CREG: 0,5") == -1) {
-    Serial.println("❌ Network: Not registered - " + networkResponse);
-  }
-  
-  // Only log signal strength issues, not regular status
-  // getSignalStrength(); // Commented out to reduce logging
-  
-  // Removed regular status messages to reduce logging noise
 }
 
+void monitorSystemHealth() {
+  if (nowMs() - lastHeapCheck > HEAP_CHECK_INTERVAL) {
+    lastHeapCheck = nowMs();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < 15000) {
+      Serial.printf("⚠️  LOW MEMORY WARNING: %lu bytes free\n", (unsigned long)freeHeap);
+      if (!isProcessingSMS) safeDelay(50);
+    }
+  }
+  feedWDT();
+}
+
+// ---------------- MQTT CALLBACK -----------------
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String msg = "";
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
   Serial.println("📨 MQTT MESSAGE RECEIVED: " + msg);
 
-  // Expected format: phone|message
   int sep = msg.indexOf('|');
-  if (sep != -1) {
-    String phone = msg.substring(0, sep);
-    String text = msg.substring(sep + 1);
-    
-    Serial.println("📥 SMS REQUEST for: " + phone);
-    Serial.println("📝 Message: \"" + text + "\"");
-    
-    bool success = sendSMS(phone, text);
-    
-    if (success) {
-      Serial.println("✅ SMS ACCEPTED FOR SENDING");
-    } else {
-      Serial.println("❌ SMS REJECTED (rate limited or busy)");
-    }
-  } else {
+  if (sep == -1) {
     Serial.println("❌ INVALID MESSAGE FORMAT. Use phone|message");
+    return;
   }
+  String phone = msg.substring(0, sep);
+  String text  = msg.substring(sep + 1);
+
+  Serial.println("📥 SMS REQUEST for: " + phone);
+  Serial.println("📝 Message: \"" + text + "\"");
+
+  bool success = sendSMS(phone, text);
+  if (success) Serial.println("✅ SMS ACCEPTED FOR SENDING");
+  else         Serial.println("❌ SMS REJECTED (rate limited or busy)");
 }
 
-void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    
-    bool connected = false;
-    
-    // Connect with or without authentication
-    if (strlen(mqtt_username) > 0 && strlen(mqtt_password) > 0) {
-      connected = client.connect(mqtt_client_id, mqtt_username, mqtt_password);
-      Serial.print(" with auth...");
-    } else {
-      connected = client.connect(mqtt_client_id);
-      Serial.print(" without auth...");
-    }
-    
-    if (connected) {
-      Serial.println("connected");
-      client.subscribe(mqtt_topic);
-      Serial.println("Subscribed to: " + String(mqtt_topic));
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
-    }
-  }
-}
+// ---------------- SETUP / LOOP ------------------
 
 void setup() {
   Serial.begin(115200);
-  sim800.begin(SIM800_BAUD, SERIAL_8N1, 16, 17); // RX, TX
+  sim800.begin(SIM800_BAUD, SERIAL_8N1, SIM800_RX, SIM800_TX);
+  Serial.println("\nChickSMS ESP32 Client Starting...");
 
-  Serial.println("ChickSMS ESP32 Client Starting...");
-  
-  // Initialize SIM800L with comprehensive check
-  delay(2000);
+  // WDT: 8 seconds timeout; panic=true (will backtrace/reboot instead of hang)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 8000,      // 8 seconds
+    .trigger_panic = true    // reset on timeout
+  };
+  esp_task_wdt_init(&wdt_config);  // pass pointer to struct
+  esp_task_wdt_add(NULL);          // add current task (loop)
+
+
+  safeDelay(1500);
   Serial.println("Initializing SIM800L...");
-  
-  // Perform full SIM check including card status and network registration
+
   if (performFullSIMCheck()) {
-    // Setup SMS reading mode only if SIM is ready
     setupSMSMode();
   } else {
-    Serial.println("⚠️  WARNING: SIM800L setup failed, but continuing with MQTT...");
-    Serial.println("SMS functionality will not work until SIM issues are resolved.");
+    Serial.println("⚠️  WARNING: SIM800L setup failed, continuing with MQTT only.");
   }
 
   setup_wifi();
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
-  
-  Serial.println("Setup complete. Ready to receive SMS commands via MQTT and monitor incoming SMS.");
-}
 
-// Safety monitoring function
-void monitorSystemHealth() {
-  // Feed watchdog timer more frequently
-  if (millis() - lastWatchdogFeed > WATCHDOG_INTERVAL) {
-    lastWatchdogFeed = millis();
-    // Feed watchdog (yield to prevent crashes)
-    yield();
-  }
-  
-  // Check free heap memory
-  if (millis() - freeHeapCheckTime > HEAP_CHECK_INTERVAL) {
-    freeHeapCheckTime = millis();
-    uint32_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < 15000) { // Less than 15KB free
-      Serial.println("⚠️  LOW MEMORY WARNING: " + String(freeHeap) + " bytes free");
-      // Force garbage collection when no SMS is processing
-      if (!isProcessingSMS) {
-        delay(100);
-      }
-    }
-  }
+  Serial.println("Setup complete. Ready for MQTT commands and SMS monitoring.");
 }
 
 void loop() {
-  // Safety monitoring first
   monitorSystemHealth();
-  
+
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastWiFiTry = 0;
+    if (nowMs() - lastWiFiTry > 5000) {
+      lastWiFiTry = nowMs();
+      WiFi.reconnect();
+    }
+  }
+
   if (!client.connected()) {
     reconnect();
+    mqtConnectFailureCount++;
+    if(mqtConnectFailureCount > 10) {
+      Serial.println("⚠️  Too many MQTT connection failures, restarting ESP32...");
+      delay(1000); // Give time for serial message to be sent
+      ESP.restart();
+    }
   }
   client.loop();
+
   
-  // Check for immediate SMS notifications (real-time)
-  checkSMSNotifications();
-  
-  // Periodic SIM status monitoring
-  periodicSIMCheck();
-  
-  // Check for incoming SMS periodically (backup method)
-  checkForIncomingSMS();
-  
-  // Small delay to prevent overwhelming the system
-  delay(150); // Increased delay for stability
+
+  checkSMSNotifications();  // immediate CNMI
+  periodicSIMCheck();       // 60s health
+  checkForIncomingSMS();    // 10s backup poll
+
+  delay(120);               // modest pacing
 }

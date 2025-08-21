@@ -151,7 +151,7 @@ class MqttService {
           const smsLog = await prisma.smsLog.findFirst({
             where: {
               phoneNumber,
-              status: { in: ['PENDING', 'RETRY', 'QUEUED'] } // Include QUEUED for bulk SMS
+              status: { in: ['PENDING', 'SENDING', 'RETRY', 'QUEUED'] } // Include SENDING status
             },
             orderBy: { createdAt: 'desc' }
           });
