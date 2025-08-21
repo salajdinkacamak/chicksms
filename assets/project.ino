@@ -326,10 +326,14 @@ bool sendSMSImmediate(const String& phone, const String& text) {
     return false;
   }
 
+  // Report SENDING status immediately at the very top to ensure it's sent even if flash issues occur later
+  reportSMSStatus(phone, "SENDING", "");
+  
+  // Small delay to ensure MQTT message is transmitted before proceeding
+  safeDelay(500);
+
   Serial.printf("📤 SENDING SMS to: %s\n📝 \"%s\"\n💾 Free heap: %lu bytes\n",
                 phone.c_str(), text.c_str(), (unsigned long)freeHeap);
-
-  reportSMSStatus(phone, "SENDING", "");
 
   // Robust pre-checks
   bool alive = false;

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const docsRouter = require('./routes/docs');
 require('dotenv').config();
 
 const logger = require('./utils/logger');
@@ -49,6 +50,8 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/sms', smsRoutes);
 app.use('/api/logs', logsRoutes);
+// Swagger UI route
+app.use('/docs', docsRouter);
 
 // Root endpoint
 app.get('/', (req, res) => {

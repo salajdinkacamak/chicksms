@@ -13,7 +13,36 @@ let smsQueue = [];
 let isProcessingQueue = false;
 let queueProcessor = null;
 
-// Send SMS endpoint
+/**
+ * @swagger
+ * /api/sms/send:
+ *   post:
+ *     summary: Send an SMS (queued for Arduino-safe processing)
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - phoneNumber
+ *               - message
+ *             properties:
+ *               phoneNumber:
+ *                 type: string
+ *                 example: '+1234567890'
+ *               message:
+ *                 type: string
+ *                 example: 'Hello from ChickSMS!'
+ *     responses:
+ *       200:
+ *         description: SMS added to queue
+ *       400:
+ *         description: Invalid input
+ */
 router.post('/send', authMiddleware, async (req, res) => {
   try {
     const { phoneNumber, message } = req.body;
@@ -64,7 +93,29 @@ router.post('/send', authMiddleware, async (req, res) => {
   }
 });
 
-// Retry failed SMS
+/**
+ * @swagger
+ * /api/sms/retry/{id}:
+ *   post:
+ *     summary: Retry sending a failed SMS
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: SMS log ID
+ *     responses:
+ *       200:
+ *         description: SMS retry queued
+ *       400:
+ *         description: SMS already sent or retry limit reached
+ *       404:
+ *         description: SMS not found
+ */
 router.post('/retry/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -127,7 +178,27 @@ router.post('/retry/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Get SMS status
+/**
+ * @swagger
+ * /api/sms/status/{id}:
+ *   get:
+ *     summary: Get the status of a specific SMS
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: SMS log ID
+ *     responses:
+ *       200:
+ *         description: SMS status
+ *       404:
+ *         description: SMS not found
+ */
 router.get('/status/:id', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -153,7 +224,30 @@ router.get('/status/:id', authMiddleware, async (req, res) => {
   }
 });
 
-// Get bulk SMS status summary
+/**
+ * @swagger
+ * /api/sms/bulk-status:
+ *   get:
+ *     summary: Get bulk SMS status summary for a user
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: userId
+ *         schema:
+ *           type: string
+ *         description: User ID (admin only)
+ *       - in: query
+ *         name: timeframe
+ *         schema:
+ *           type: string
+ *           enum: [1h, 24h, 7d]
+ *         description: Timeframe for summary (default: 1h)
+ *     responses:
+ *       200:
+ *         description: Bulk SMS status summary
+ */
 router.get('/bulk-status', authMiddleware, async (req, res) => {
   try {
     const { userId, timeframe = '1h' } = req.query;
@@ -240,7 +334,41 @@ router.get('/bulk-status', authMiddleware, async (req, res) => {
   }
 });
 
-// Bulk SMS endpoint
+/**
+ * @swagger
+ * /api/sms/bulk:
+ *   post:
+ *     summary: Send bulk SMS (queued for Arduino-safe processing)
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - recipients
+ *               - message
+ *             properties:
+ *               recipients:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 example: ['+1234567890', '+1987654321']
+ *               message:
+ *                 type: string
+ *                 example: 'Bulk message!'
+ *               delaySeconds:
+ *                 type: integer
+ *                 description: (Ignored, system uses safe delay)
+ *     responses:
+ *       200:
+ *         description: Bulk SMS added to queue
+ *       400:
+ *         description: Invalid input
+ */
 router.post('/bulk', authMiddleware, async (req, res) => {
   try {
     const { recipients, message, delaySeconds } = req.body;
@@ -334,7 +462,18 @@ router.post('/bulk', authMiddleware, async (req, res) => {
   }
 });
 
-// Queue status endpoint
+/**
+ * @swagger
+ * /api/sms/queue-status:
+ *   get:
+ *     summary: Get the current SMS queue status
+ *     tags: [SMS]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Queue status
+ */
 router.get('/queue-status', authMiddleware, async (req, res) => {
   try {
     const queueStatus = getQueueStatus();

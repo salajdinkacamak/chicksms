@@ -6,7 +6,56 @@ const logger = require('../utils/logger');
 const router = express.Router();
 const prisma = new PrismaClient();
 
-// Get SMS logs with pagination and filtering
+/**
+ * @swagger
+ * /api/logs/sms:
+ *   get:
+ *     summary: Get SMS logs with pagination and filtering
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *         description: Number of records per page
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *         description: Filter by status
+ *       - in: query
+ *         name: phoneNumber
+ *         schema:
+ *           type: string
+ *         description: Filter by phone number
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date
+ *       - in: query
+ *         name: userId
+ *         schema:
+ *           type: string
+ *         description: Filter by user ID
+ *     responses:
+ *       200:
+ *         description: List of SMS logs
+ */
 router.get('/sms', authMiddleware, async (req, res) => {
   try {
     const {
@@ -84,7 +133,51 @@ router.get('/sms', authMiddleware, async (req, res) => {
   }
 });
 
-// Get incoming SMS logs
+/**
+ * @swagger
+ * /api/logs/incoming:
+ *   get:
+ *     summary: Get incoming SMS logs
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *         description: Number of records per page
+ *       - in: query
+ *         name: phoneNumber
+ *         schema:
+ *           type: string
+ *         description: Filter by phone number
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date
+ *       - in: query
+ *         name: processed
+ *         schema:
+ *           type: boolean
+ *         description: Filter by processed status
+ *     responses:
+ *       200:
+ *         description: List of incoming SMS logs
+ */
 router.get('/incoming', authMiddleware, async (req, res) => {
   try {
     const {
@@ -152,7 +245,37 @@ router.get('/incoming', authMiddleware, async (req, res) => {
   }
 });
 
-// Mark incoming SMS as processed
+/**
+ * @swagger
+ * /api/logs/incoming/{id}/processed:
+ *   put:
+ *     summary: Mark incoming SMS as processed
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Incoming SMS ID
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               processed:
+ *                 type: boolean
+ *                 default: true
+ *     responses:
+ *       200:
+ *         description: SMS processed status updated
+ *       404:
+ *         description: SMS not found
+ */
 router.put('/incoming/:id/processed', authMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
@@ -177,7 +300,34 @@ router.put('/incoming/:id/processed', authMiddleware, async (req, res) => {
   }
 });
 
-// Get failed SMS logs (for retry queue)
+/**
+ * @swagger
+ * /api/logs/failed:
+ *   get:
+ *     summary: Get failed SMS logs (for retry queue)
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *         description: Number of records per page
+ *       - in: query
+ *         name: maxRetries
+ *         schema:
+ *           type: integer
+ *         description: Maximum retry count
+ *     responses:
+ *       200:
+ *         description: List of failed SMS logs
+ */
 router.get('/failed', authMiddleware, async (req, res) => {
   try {
     const {
@@ -231,7 +381,36 @@ router.get('/failed', authMiddleware, async (req, res) => {
   }
 });
 
-// Get SMS statistics
+/**
+ * @swagger
+ * /api/logs/stats:
+ *   get:
+ *     summary: Get SMS statistics
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date
+ *       - in: query
+ *         name: userId
+ *         schema:
+ *           type: string
+ *         description: Filter by user ID
+ *     responses:
+ *       200:
+ *         description: SMS statistics
+ */
 router.get('/stats', authMiddleware, async (req, res) => {
   try {
     const { startDate, endDate, userId } = req.query;
@@ -321,7 +500,51 @@ router.get('/stats', authMiddleware, async (req, res) => {
   }
 });
 
-// Get login attempt logs
+/**
+ * @swagger
+ * /api/logs/login-attempts:
+ *   get:
+ *     summary: Get login attempt logs
+ *     tags: [Logs]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *         description: Page number
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *         description: Number of records per page
+ *       - in: query
+ *         name: username
+ *         schema:
+ *           type: string
+ *         description: Filter by username
+ *       - in: query
+ *         name: success
+ *         schema:
+ *           type: boolean
+ *         description: Filter by success status
+ *       - in: query
+ *         name: startDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: Start date
+ *       - in: query
+ *         name: endDate
+ *         schema:
+ *           type: string
+ *           format: date-time
+ *         description: End date
+ *     responses:
+ *       200:
+ *         description: List of login attempt logs
+ */
 router.get('/login-attempts', authMiddleware, async (req, res) => {
   try {
     const {

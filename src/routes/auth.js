@@ -8,7 +8,36 @@ const logger = require('../utils/logger');
 const router = express.Router();
 const prisma = new PrismaClient();
 
-// Login endpoint
+/**
+ * @swagger
+ * /api/auth/login:
+ *   post:
+ *     summary: User login
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - username
+ *               - password
+ *             properties:
+ *               username:
+ *                 type: string
+ *                 example: 'user1'
+ *               password:
+ *                 type: string
+ *                 example: 'password123'
+ *     responses:
+ *       200:
+ *         description: Login successful
+ *       400:
+ *         description: Missing credentials
+ *       401:
+ *         description: Invalid credentials
+ */
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -63,7 +92,20 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Get user profile
+/**
+ * @swagger
+ * /api/auth/profile:
+ *   get:
+ *     summary: Get user profile
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: User profile
+ *       401:
+ *         description: Unauthorized
+ */
 router.get('/profile', authMiddleware, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
@@ -84,7 +126,36 @@ router.get('/profile', authMiddleware, async (req, res) => {
   }
 });
 
-// Change password
+/**
+ * @swagger
+ * /api/auth/change-password:
+ *   post:
+ *     summary: Change user password
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - currentPassword
+ *               - newPassword
+ *             properties:
+ *               currentPassword:
+ *                 type: string
+ *               newPassword:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Password changed successfully
+ *       400:
+ *         description: Missing fields
+ *       401:
+ *         description: Invalid current password
+ */
 router.post('/change-password', authMiddleware, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
@@ -124,7 +195,20 @@ router.post('/change-password', authMiddleware, async (req, res) => {
   }
 });
 
-// Verify token endpoint
+/**
+ * @swagger
+ * /api/auth/verify:
+ *   get:
+ *     summary: Verify JWT token
+ *     tags: [Auth]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Token is valid
+ *       401:
+ *         description: Unauthorized
+ */
 router.get('/verify', authMiddleware, (req, res) => {
   res.json({ 
     valid: true, 

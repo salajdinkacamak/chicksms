@@ -35,6 +35,8 @@
     "jsonwebtoken": "^9.0.1",
     "mqtt": "^5.0.0",
     "mysql2": "^3.6.0",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "uuid": "^9.0.0",
     "winston": "^3.10.0"
   },
