@@ -565,6 +565,29 @@ void checkSMSNotifications() {
       }
     }
   }
+
+  // +CMT: "+38348670660","","25/08/22,17:27:52+08"
+  int cmt = notification.indexOf("+CMT:");
+  if (cmt != -1) {
+    // Extract phone number
+    int q1 = notification.indexOf("\"", cmt);
+    int q2 = notification.indexOf("\"", q1 + 1);
+    String phoneNumber = "";
+    if (q1 != -1 && q2 != -1) {
+      phoneNumber = notification.substring(q1 + 1, q2);
+    }
+    // Message is after the next line break
+    int msgStart = notification.indexOf("\n", q2);
+    String message = "";
+    if (msgStart != -1) {
+      message = notification.substring(msgStart + 1);
+      message.trim();
+      message.replace("\"", "");
+    }
+    if (phoneNumber.length() && message.length()) {
+      reportIncomingSMS(phoneNumber, message);
+    }
+  }
 }
 
 // ---------------- PERIODIC HEALTH ---------------

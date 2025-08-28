@@ -7,6 +7,7 @@ const logger = require('../utils/logger');
 const router = express.Router();
 const prisma = new PrismaClient();
 const DELAY_BETWEEN_MESSAGES = 45000; // 45 seconds - increased delay for Arduino stability during bulk operations
+const MAX_BULK_REQUEST = 1000;
 
 // Global queue management for Arduino-safe processing
 let smsQueue = [];
@@ -383,9 +384,9 @@ router.post('/bulk', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    if (recipients.length > 100) {
+    if (recipients.length > MAX_BULK_REQUEST) {
       return res.status(400).json({ 
-        error: 'Maximum 100 recipients allowed per bulk request to prevent overwhelming the system' 
+        error: `Maximum ${MAX_BULK_REQUEST} recipients allowed per bulk request to prevent overwhelming the system` 
       });
     }
 
