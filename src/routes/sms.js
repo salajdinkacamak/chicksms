@@ -238,7 +238,7 @@ router.get('/status/:id', authMiddleware, async (req, res) => {
  *         name: userId
  *         schema:
  *           type: string
- *         description: User ID (admin only)
+ *         description: "User ID (admin only)"
  *       - in: query
  *         name: timeframe
  *         schema:
@@ -363,7 +363,7 @@ router.get('/bulk-status', authMiddleware, async (req, res) => {
  *                 example: 'Bulk message!'
  *               delaySeconds:
  *                 type: integer
- *                 description: (Ignored, system uses safe delay)
+ *                 description: "(Ignored, system uses safe delay)"
  *     responses:
  *       200:
  *         description: Bulk SMS added to queue
