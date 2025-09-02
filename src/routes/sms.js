@@ -244,7 +244,7 @@ router.get('/status/:id', authMiddleware, async (req, res) => {
  *         schema:
  *           type: string
  *           enum: [1h, 24h, 7d]
- *         description: Timeframe for summary (default: 1h)
+ *         description: "Timeframe for summary (default: 1h)"
  *     responses:
  *       200:
  *         description: Bulk SMS status summary
